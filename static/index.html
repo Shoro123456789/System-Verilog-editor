@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SV Studio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c5cff'/%3E%3Cpath d='M5 21h5V11h6v10h5V11h6' fill='none' stroke='white' stroke-width='2.6' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<script>window.SVS_TOKEN = "__SVS_TOKEN__";</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" width="26" height="26"><rect width="32" height="32" rx="8" fill="url(#g)"/><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs><path d="M5 21h5V11h6v10h5V11h6" fill="none" stroke="#fff" stroke-width="2.6" stroke-linejoin="round"/></svg>
+    <span>SV Studio</span>
+  </div>
+  <button class="project-pill" id="projPill" title="Open a project">
+    <span class="dot" id="projDot"></span>
+    <span class="pname" id="projName">No project open</span>
+    <span class="ppath" id="projPath">Click to open a Questa .mpf or folder</span>
+  </button>
+  <button class="search-btn" id="btnQuick" title="Go to file / module (Ctrl+P) · commands (Ctrl+Shift+P or F1)">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+    <span class="lbl">Search files, modules, commands</span><kbd>Ctrl P</kbd>
+  </button>
+  <div class="spacer"></div>
+  <label class="field"><span>Simulator</span>
+    <select id="selBackend">
+      <option value="questa">Questa</option>
+      <option value="verilator">Verilator</option>
+      <option value="icarus">Icarus</option>
+    </select>
+  </label>
+  <label class="field"><span>Top</span><select id="selTop"><option value="">—</option></select></label>
+  <label class="field"><span>Run for</span><input id="inpRun" value="-all" spellcheck="false" title="-all, or a time such as 500ns, 20us, 1ms"></label>
+  <button class="btn" id="btnCompile" title="Compile (F7)">
+    <svg viewBox="0 0 24 24"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg>Compile</button>
+  <button class="btn primary" id="btnRun" title="Compile + simulate (F5)">
+    <svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z" class="fill"/></svg>Simulate</button>
+  <button class="btn danger" id="btnStop" hidden>
+    <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" class="fill"/></svg>Stop</button>
+  <button class="icon-btn" id="btnSettings" title="Settings">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+  </button>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="side-head">
+      <span>Files</span>
+      <div class="side-actions">
+        <button class="icon-btn sm" id="btnReload" title="Reload project"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button>
+        <button class="icon-btn sm" id="btnCodeFolder" title="Open project folder in VS Code"><svg viewBox="0 0 24 24"><path d="M17 3l4 2v14l-4 2-10-9 10-9zM7 12l-4 3V9l4 3z"/></svg></button>
+      </div>
+    </div>
+    <ul class="file-list" id="fileList"><li class="empty">No project open</li></ul>
+    <div class="side-head"><span>Modules</span></div>
+    <ul class="mod-list" id="modList"></ul>
+  </aside>
+  <div class="resizer" data-resize="sidebar" title="Drag to resize"></div>
+
+  <main class="main">
+    <nav class="tabs" id="tabs">
+      <button data-tab="console" class="active">Console <span class="badge" id="consoleBadge" hidden></span></button>
+      <button data-tab="problems">Problems <span class="badge" id="problemsBadge" hidden></span></button>
+      <button data-tab="wave">Waveform <span class="badge info" id="waveBadge" hidden></span></button>
+      <button data-tab="editor">Editor <span class="badge dim" id="editorBadge" hidden></span></button>
+    </nav>
+
+    <section class="tab active" id="tab-console">
+      <div class="console-bar">
+        <span class="job-chip" id="jobChip">Idle</span>
+        <div class="spacer"></div>
+        <label class="check"><input type="checkbox" id="chkWrap"> Wrap</label>
+        <button class="btn ghost sm" id="btnClear">Clear</button>
+      </div>
+      <div class="console" id="console">
+        <div class="welcome">
+          <h2>Welcome to SV Studio</h2>
+          <p>Open a Questa project (<code>.mpf</code>) or a folder of <code>.sv</code> files, pick your testbench as <b>Top</b>, and press <b>Simulate</b>.</p>
+          <ul>
+            <li><kbd>F5</kbd> compile + simulate &nbsp;·&nbsp; <kbd>F7</kbd> compile &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>S</kbd> save file</li>
+            <li><kbd>Ctrl</kbd>+<kbd>P</kbd> open a file or module &nbsp;·&nbsp; <kbd>F1</kbd> all commands</li>
+            <li>Click an error location to jump to it, <kbd>Ctrl</kbd>+click to open it in VS Code.</li>
+            <li>Waveform: drag to pan, <kbd>Ctrl</kbd>+scroll to zoom, <kbd>←</kbd>/<kbd>→</kbd> jump between edges.</li>
+          </ul>
+          <button class="btn primary" id="btnWelcomeOpen">Open project</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-problems">
+      <div class="problems" id="problems"><div class="empty-big">No problems yet. Compile or simulate to check your code.</div></div>
+    </section>
+
+    <section class="tab" id="tab-wave">
+      <div class="wave-toolbar">
+        <div class="seg">
+          <button class="icon-btn sm" id="wZoomIn" title="Zoom in (+)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6M11 8v6"/></svg></button>
+          <button class="icon-btn sm" id="wZoomOut" title="Zoom out (-)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/></svg></button>
+          <button class="icon-btn sm" id="wFit" title="Zoom to fit (F)"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+        </div>
+        <div class="seg">
+          <button class="icon-btn sm" id="wPrev" title="Previous edge of selected signal (←)"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+          <button class="icon-btn sm" id="wNext" title="Next edge of selected signal (→)"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+        </div>
+        <span class="cursor-time" id="wCursor">Cursor: —</span>
+        <div class="spacer"></div>
+        <span class="muted small" id="wInfo"></span>
+        <button class="btn ghost sm" id="wClear" title="Remove all signals from the view">Clear view</button>
+        <button class="btn sm" id="wOpen">Open VCD…</button>
+      </div>
+      <div class="wave-body">
+        <div class="sig-tree">
+          <div class="tree-search"><input id="treeFilter" placeholder="Filter signals…" spellcheck="false"></div>
+          <div class="tree" id="tree"><div class="empty">Run a simulation to see signals</div></div>
+        </div>
+        <div class="resizer" data-resize="tree" title="Drag to resize"></div>
+        <div class="wave-main" id="waveMain">
+          <div class="wave-header">
+            <div class="names-head"><span>Signal</span><span>Value</span><div class="resizer col" data-resize="names" title="Drag to resize"></div></div>
+            <canvas id="axis"></canvas>
+          </div>
+          <div class="wave-scroll" id="waveScroll">
+            <div class="names" id="names"></div>
+            <canvas id="waves"></canvas>
+          </div>
+          <div class="wave-empty" id="waveEmpty">
+            <svg viewBox="0 0 120 40" width="160"><path d="M2 30h14V10h22v20h18V10h22v20h18V10h22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/></svg>
+            <p>No waveform loaded yet.<br>Press <b>Simulate</b> or open a <code>.vcd</code> file.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-editor">
+      <div class="editor-bar">
+        <div class="ed-tabs" id="edTabs"></div>
+        <span class="muted small" id="edPos"></span>
+        <button class="icon-btn sm" id="btnFormat" title="Format document (Shift+Alt+F)" disabled><svg viewBox="0 0 24 24"><path d="M4 6h16M8 10h12M8 14h12M4 18h16"/></svg></button>
+        <button class="btn sm" id="btnSave" disabled>Save</button>
+        <button class="btn sm" id="btnEdCode" disabled>Open in VS Code</button>
+      </div>
+      <div class="ext-banner" id="extBanner" hidden>
+        <span id="extMsg"></span><div class="spacer"></div>
+        <button class="btn sm" id="extReload">Reload from disk</button>
+        <button class="btn ghost sm" id="extKeep">Keep my version</button>
+      </div>
+      <div class="cm-host" id="cmHost"><div class="cm-empty" id="cmEmpty">Select a file in the sidebar to edit it</div></div>
+    </section>
+  </main>
+</div>
+
+<footer class="statusbar">
+  <div class="chips" id="toolChips"></div>
+  <div class="spacer"></div>
+  <span id="statusText">Ready</span>
+</footer>
+
+<dialog id="dlgOpen">
+  <form method="dialog" class="dlg">
+    <h3>Open project</h3>
+    <p class="muted">A Questa/ModelSim project file (<code>.mpf</code>), or a folder containing <code>.sv</code>/<code>.v</code> files.</p>
+    <div class="row">
+      <input id="openPath" placeholder="C:\Users\you\COMP12111\mu0\mu0.mpf" spellcheck="false">
+    </div>
+    <div class="row gap">
+      <button type="button" class="btn" id="browseFile">Browse for .mpf…</button>
+      <button type="button" class="btn" id="browseDir">Browse for folder…</button>
+    </div>
+    <div class="recent-head">Recent</div>
+    <ul class="recent" id="recentList"></ul>
+    <div class="dlg-actions">
+      <button value="cancel" class="btn ghost">Cancel</button>
+      <button type="button" class="btn primary" id="openGo">Open</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlgSettings">
+  <form method="dialog" class="dlg wide">
+    <h3>Settings</h3>
+    <div class="grid">
+      <label>Questa bin folder<input data-cfg="questa_bin" placeholder="auto-detect, e.g. C:\altera_lite\25.1std\questa_fse\win64"></label>
+      <label>Questa license file<input data-cfg="license_file" placeholder="e.g. C:\licenses\questa_license.dat (sets LM_LICENSE_FILE)"></label>
+      <label>VS Code executable<input data-cfg="vscode_path" placeholder="auto-detect (code on PATH)"></label>
+      <label>Extra vlog flags<input data-cfg="vlog_flags" placeholder="e.g. -timescale 1ns/1ps +define+SIM"></label>
+      <label>Extra vcom flags<input data-cfg="vcom_flags"></label>
+      <label>Extra vsim flags<input data-cfg="vsim_flags" placeholder="e.g. -t ps"></label>
+      <label>Extra Verilator flags<input data-cfg="verilator_flags"></label>
+      <label>Extra iverilog flags<input data-cfg="iverilog_flags"></label>
+      <label class="check"><input type="checkbox" data-cfg="compile_before_sim"> Compile before every simulation (Questa)</label>
+    </div>
+    <div class="detected" id="detected"></div>
+    <div class="dlg-actions">
+      <button value="cancel" class="btn ghost">Cancel</button>
+      <button type="button" class="btn primary" id="settingsSave">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="palette-wrap" id="palette" hidden>
+  <div class="palette">
+    <div class="pal-input"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="palInput" spellcheck="false" autocomplete="off"></div>
+    <ul class="pal-list" id="palList"></ul>
+    <div class="pal-foot"><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>&gt;</kbd> commands</span><span><kbd>:</kbd> go to line</span><span><kbd>Esc</kbd> close</span></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="editor.bundle.js"></script>
+<script src="wave.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

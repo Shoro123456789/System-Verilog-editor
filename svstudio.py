@@ -1,0 +1,1319 @@
+#!/usr/bin/env python3
+"""
+SV Studio - compile, simulate and view waveforms for Questa SystemVerilog projects.
+
+Runs a small local web server (127.0.0.1 only) and opens a modern UI window.
+Backends: Questa / ModelSim (vlog + vsim), Verilator 5+, Icarus Verilog.
+No third-party Python packages required.
+
+Usage:
+    python svstudio.py [path/to/project.mpf | path/to/folder] [--port N] [--no-window]
+"""
+import argparse
+import glob
+import hashlib
+import json
+import os
+import platform
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+APP_NAME = "SV Studio"
+VERSION = "1.0.0"
+APP_DIR = Path(__file__).resolve().parent
+STATIC_DIR = APP_DIR / "static"
+CONFIG_PATH = Path.home() / ".svstudio.json"
+BUILD_DIR = ".svstudio"           # created inside the project folder
+WRAPPER_TOP = "svs_top"
+IS_WIN = platform.system() == "Windows"
+TOKEN = secrets.token_hex(16)
+
+HDL_KINDS = {
+    ".sv": "sv", ".v": "v", ".svh": "header", ".vh": "header",
+    ".vhd": "vhdl", ".vhdl": "vhdl",
+}
+SKIP_DIRS = {BUILD_DIR, "work", "obj_dir", ".git", "node_modules", "__pycache__", ".vscode"}
+
+DEFAULT_CONFIG = {
+    "questa_bin": "",          # folder containing vlog/vsim (auto-detected if empty)
+    "license_file": "",        # sets LM_LICENSE_FILE / SALT_LICENSE_SERVER for Questa
+    "vscode_path": "",         # path to `code` (auto-detected if empty)
+    "vlog_flags": "",
+    "vcom_flags": "-2008",
+    "vsim_flags": "",
+    "verilator_flags": "",
+    "iverilog_flags": "",
+    "compile_before_sim": True,
+    "recent": [],
+}
+
+
+# --------------------------------------------------------------------------- config
+_config_lock = threading.Lock()
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    with _config_lock:
+        try:
+            CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        except Exception as e:
+            print("Could not save config:", e)
+
+
+CONFIG = load_config()
+
+
+# --------------------------------------------------------------------------- tool discovery
+def _exe(name):
+    return name + ".exe" if IS_WIN else name
+
+
+def questa_candidates():
+    pats = []
+    if IS_WIN:
+        for drive in ("C:", "D:"):
+            pats += [
+                drive + "/intelFPGA*/*/questa_fse/win64",
+                drive + "/intelFPGA*/*/questa_fe/win64",
+                drive + "/altera*/*/questa_fse/win64",
+                drive + "/altera*/*/questa_fe/win64",
+                drive + "/questasim*/win64",
+                drive + "/Questa*/win64",
+                drive + "/modeltech*/win*",
+                drive + "/intelFPGA*/*/modelsim_ase/win32aloem",
+            ]
+    else:
+        home = str(Path.home())
+        for base in (home, "/opt", "/tools", "/usr/local"):
+            pats += [
+                base + "/intelFPGA*/*/questa_fse/bin",
+                base + "/intelFPGA*/*/questa_fe/bin",
+                base + "/altera*/*/questa_fse/bin",
+                base + "/altera*/*/questa_fe/bin",
+                base + "/questasim*/bin",
+                base + "/questa*/bin",
+                base + "/mentor/questasim*/bin",
+                base + "/siemens/questa*/bin",
+            ]
+    out = []
+    for p in pats:
+        out += sorted(glob.glob(p), reverse=True)
+    return out
+
+
+def find_questa_bin():
+    cand = []
+    if CONFIG.get("questa_bin"):
+        cand.append(CONFIG["questa_bin"])
+    w = shutil.which("vsim")
+    if w:
+        cand.append(str(Path(w).parent))
+    cand += questa_candidates()
+    for d in cand:
+        if d and (Path(d) / _exe("vsim")).exists() and (Path(d) / _exe("vlog")).exists():
+            return str(Path(d))
+    return None
+
+
+def find_vscode():
+    if CONFIG.get("vscode_path") and Path(CONFIG["vscode_path"]).exists():
+        return CONFIG["vscode_path"]
+    for n in ("code", "code-insiders", "codium"):
+        w = shutil.which(n)
+        if w:
+            return w
+    if IS_WIN:
+        la = os.environ.get("LOCALAPPDATA", "")
+        for p in (
+            la + r"\Programs\Microsoft VS Code\bin\code.cmd",
+            r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
+            la + r"\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd",
+        ):
+            if Path(p).exists():
+                return p
+    if platform.system() == "Darwin":
+        p = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+        if Path(p).exists():
+            return p
+    return None
+
+
+# ---- WSL (lets the Windows app use Linux-only tools such as Verilator)
+_wsl_lock = threading.Lock()
+_wsl_cache = {}
+
+
+def wsl_available():
+    if not IS_WIN or not shutil.which("wsl"):
+        return False
+    return wsl_tool("sh") is not None
+
+
+def wsl_tool(name):
+    """Path of `name` inside the default WSL distro, or None. Cached; first call may boot WSL."""
+    if not IS_WIN:
+        return None
+    with _wsl_lock:
+        if name in _wsl_cache:
+            return _wsl_cache[name]
+        res = None
+        wsl = shutil.which("wsl")
+        if wsl:
+            try:
+                r = subprocess.run([wsl, "-e", "sh", "-lc", f"command -v {name}"], capture_output=True,
+                                   timeout=60, stdin=subprocess.DEVNULL, creationflags=0x08000000)
+                out = r.stdout.decode("utf-8", "replace").replace("\x00", "").strip()
+                if r.returncode == 0 and out.startswith("/"):
+                    res = out.splitlines()[0]
+            except Exception:
+                pass
+        _wsl_cache[name] = res
+        return res
+
+
+def wsl_home():
+    """$HOME inside WSL (cached)."""
+    if "__home__" in _wsl_cache:
+        return _wsl_cache["__home__"]
+    home = None
+    try:
+        r = subprocess.run([shutil.which("wsl") or "wsl.exe", "-e", "sh", "-c", "echo $HOME"], capture_output=True,
+                           timeout=60, stdin=subprocess.DEVNULL, creationflags=0x08000000 if IS_WIN else 0)
+        out = r.stdout.decode("utf-8", "replace").replace("\x00", "").strip()
+        home = out if out.startswith("/") else None
+    except Exception:
+        pass
+    _wsl_cache["__home__"] = home
+    return home
+
+
+def verilator_mdir(root, via_wsl):
+    """Where Verilator builds. GNU make can't build in a path containing spaces, and WSL builds are much
+    faster on the Linux filesystem than on /mnt/c - so build outside the project when needed."""
+    tag = re.sub(r"\W+", "_", Path(root).name)[:40] + "_" + hashlib.md5(str(root).lower().encode()).hexdigest()[:8]
+    if via_wsl:
+        home = wsl_home()
+        base = f"{home}/.cache/svstudio" if home and " " not in home else "/tmp/svstudio"
+        d = f"{base}/{tag}"
+        try:
+            subprocess.run([shutil.which("wsl") or "wsl.exe", "-e", "mkdir", "-p", d], capture_output=True,
+                           timeout=60, stdin=subprocess.DEVNULL, creationflags=0x08000000 if IS_WIN else 0)
+        except Exception:
+            pass
+        return d
+    if " " in str(root):
+        base = Path(tempfile.gettempdir()) / "svstudio"
+        if " " in str(base):
+            base = Path("/tmp/svstudio") if not IS_WIN else Path(os.environ.get("SystemDrive", "C:") + "/svstudio_build")
+        d = base / tag
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
+    d = Path(root) / BUILD_DIR / "obj_dir"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d.resolve())
+
+
+# Verilator aborts on $stop (and loses the end of the waveform). Questa testbenches often end with
+# $stop, so SV Studio swaps in a handler that ends the simulation cleanly, like $finish.
+VL_STOP_CPP = """#include "verilated.h"
+// Generated by SV Studio: make $stop end the simulation cleanly (like $finish) instead of aborting.
+void vl_stop(const char* filename, int linenum, const char* hier) VL_MT_UNSAFE {
+    if (false && hier) {}
+    VL_PRINTF("- %s:%d: Verilog $stop (ending simulation)\\n", filename, linenum);
+    Verilated::threadContextp()->gotFinish(true);
+}
+"""
+
+
+def write_stop_handler(mdir, via_wsl):
+    """Put svs_stop.cpp inside the Verilator build dir (make runs there, so paths stay space-free)."""
+    path = f"{mdir}/svs_stop.cpp"
+    if via_wsl:
+        subprocess.run([shutil.which("wsl") or "wsl.exe", "-e", "sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", path],
+                       input=VL_STOP_CPP.encode(), capture_output=True, timeout=60,
+                       creationflags=0x08000000 if IS_WIN else 0)
+    else:
+        Path(path).write_text(VL_STOP_CPP, encoding="utf-8")
+    return path
+
+
+def to_wsl_path(p):
+    s = str(p).replace("\\", "/")
+    m = re.match(r"^([A-Za-z]):/?(.*)$", s)
+    if m:
+        return f"/mnt/{m.group(1).lower()}/{m.group(2)}".rstrip("/") or "/"
+    m = re.match(r"^//(?:wsl\$|wsl\.localhost)/[^/]+(/.*)?$", s, re.I)
+    if m:
+        return m.group(1) or "/"
+    return s
+
+
+def _tool_label(name):
+    p = shutil.which(name)
+    if p:
+        return p
+    w = wsl_tool(name)
+    return f"WSL: {w}" if w else None
+
+
+def tool_status():
+    q = find_questa_bin()
+    return {
+        "questa": q,
+        "verilator": _tool_label("verilator"),
+        "icarus": _tool_label("iverilog"),
+        "vscode": find_vscode(),
+        "platform": platform.system(),
+        "version": VERSION,
+    }
+
+
+# --------------------------------------------------------------------------- project parsing
+def _strip_comments(text):
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def _resolve(raw, root):
+    s = raw.strip().strip('"').strip("{}").replace("\\", "/")
+    s = os.path.expandvars(s)
+    p = Path(s)
+    if not p.is_absolute() and not re.match(r"^[A-Za-z]:/", s):
+        p = (root / s)
+    if p.exists():
+        return p.resolve(), True
+    # file was moved / project copied from another machine: look by name
+    name = Path(s).name
+    direct = root / name
+    if direct.exists():
+        return direct.resolve(), True
+    for f in root.rglob(name):
+        if not any(part in SKIP_DIRS for part in f.parts):
+            return f.resolve(), True
+    return p, False
+
+
+def _mpf_folder(props):
+    m = re.search(r"\bfolder\s+(\{[^}]*\}|\S+)", props)
+    return m.group(1).strip("{}") if m else ""
+
+
+def parse_mpf(mpf):
+    root = mpf.parent
+    text = mpf.read_text(encoding="utf-8", errors="replace")
+    files, props, fnames, fprops = {}, {}, {}, {}
+    for line in text.splitlines():
+        m = re.match(r"\s*Project_Folder_(\d+)\s*=\s*(.+?)\s*$", line)
+        if m:
+            fnames[int(m.group(1))] = m.group(2).strip("{}")
+            continue
+        m = re.match(r"\s*Project_Folder_P_(\d+)\s*=\s*(.*)$", line)
+        if m:
+            fprops[int(m.group(1))] = m.group(2)
+            continue
+        m = re.match(r"\s*Project_File_(\d+)\s*=\s*(.+?)\s*$", line)
+        if m:
+            files[int(m.group(1))] = m.group(2)
+            continue
+        m = re.match(r"\s*Project_File_P_(\d+)\s*=\s*(.*)$", line)
+        if m:
+            props[int(m.group(1))] = m.group(2)
+    # Questa virtual folders can be nested: build each folder's full path
+    parent = {}
+    for i, name in fnames.items():
+        parent[name] = _mpf_folder(fprops.get(i, ""))
+
+    def folder_path(name, depth=0):
+        if not name or name == "Top Level" or depth > 20:
+            return ""
+        up = folder_path(parent.get(name, ""), depth + 1)
+        return f"{up}/{name}" if up else name
+
+    out = []
+    for idx, raw in files.items():
+        path, exists = _resolve(raw, root)
+        order = idx
+        m = re.search(r"\bcompile_order\s+(-?\d+)", props.get(idx, ""))
+        if m:
+            order = int(m.group(1))
+        out.append({"path": str(path), "exists": exists, "order": order,
+                    "vfolder": folder_path(_mpf_folder(props.get(idx, "")))})
+    out.sort(key=lambda f: f["order"])
+    return out
+
+
+def scan_folder(root):
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+        for fn in sorted(filenames):
+            if Path(fn).suffix.lower() in HDL_KINDS:
+                out.append({"path": str(Path(dirpath, fn).resolve()), "exists": True})
+        if len(out) > 500:
+            break
+    # crude ordering: packages first, testbenches last
+    def key(f):
+        n = Path(f["path"]).name.lower()
+        return (0 if "pkg" in n or "package" in n else 2 if re.search(r"(^tb|_tb|test)", n) else 1, n)
+    out.sort(key=key)
+    for i, f in enumerate(out):
+        f["order"] = i
+    return out
+
+
+MOD_DECL = re.compile(r"^\s*(?:module|program|interface)\s+(?:automatic\s+|static\s+)?(\w+)", re.M)
+
+
+# ---- Built-in behavioural models of common Xilinx UNISIM primitives (used by schematic netlists).
+#      Only added to a build when the design instantiates them and doesn't define them itself.
+def _build_prims():
+    P = {}
+    for n in range(2, 6):
+        ins = [f"I{i}" for i in range(n)]
+        for base, op, neg in (("AND", "&", False), ("OR", "|", False), ("NAND", "&", True), ("NOR", "|", True)):
+            for b in range(0, n + 1):
+                name = f"{base}{n}" + (f"B{b}" if b else "")
+                terms = [f"~{x}" if i < b else x for i, x in enumerate(ins)]
+                expr = f" {op} ".join(terms)
+                if neg:
+                    expr = f"~({expr})"
+                P[name] = f"module {name} (output O, input {', '.join(ins)});\n  assign O = {expr};\nendmodule\n"
+        for base, neg in (("XOR", False), ("XNOR", True)):
+            expr = " ^ ".join(ins)
+            P[f"{base}{n}"] = f"module {base}{n} (output O, input {', '.join(ins)});\n  assign O = {'~(' + expr + ')' if neg else expr};\nendmodule\n"
+    for name in ("BUF", "BUFG", "IBUF", "OBUF", "BUFH"):
+        P[name] = f"module {name} (output O, input I);\n  assign O = I;\nendmodule\n"
+    P["INV"] = "module INV (output O, input I);\n  assign O = ~I;\nendmodule\n"
+    P["GND"] = "module GND (output G);\n  assign G = 1'b0;\nendmodule\n"
+    P["VCC"] = "module VCC (output P);\n  assign P = 1'b1;\nendmodule\n"
+    P["M2_1"] = "module M2_1 (output O, input D0, D1, S0);\n  assign O = S0 ? D1 : D0;\nendmodule\n"
+    P["M2_1E"] = "module M2_1E (output O, input D0, D1, S0, E);\n  assign O = E & (S0 ? D1 : D0);\nendmodule\n"
+    ff = {  # name: (ports, sensitivity, body)
+        "FD":   ("input C, D", "posedge C", "Q <= D;"),
+        "FDE":  ("input C, CE, D", "posedge C", "if (CE) Q <= D;"),
+        "FDC":  ("input C, CLR, D", "posedge C or posedge CLR", "if (CLR) Q <= 1'b0; else Q <= D;"),
+        "FDCE": ("input C, CE, CLR, D", "posedge C or posedge CLR", "if (CLR) Q <= 1'b0; else if (CE) Q <= D;"),
+        "FDP":  ("input C, D, PRE", "posedge C or posedge PRE", "if (PRE) Q <= 1'b1; else Q <= D;"),
+        "FDPE": ("input C, CE, D, PRE", "posedge C or posedge PRE", "if (PRE) Q <= 1'b1; else if (CE) Q <= D;"),
+        "FDR":  ("input C, D, R", "posedge C", "if (R) Q <= 1'b0; else Q <= D;"),
+        "FDRE": ("input C, CE, D, R", "posedge C", "if (R) Q <= 1'b0; else if (CE) Q <= D;"),
+        "FDS":  ("input C, D, S", "posedge C", "if (S) Q <= 1'b1; else Q <= D;"),
+        "FDSE": ("input C, CE, D, S", "posedge C", "if (S) Q <= 1'b1; else if (CE) Q <= D;"),
+    }
+    for name, (ports, sens, body) in ff.items():
+        P[name] = (f"module {name} #(parameter [0:0] INIT = 1'b0) (output reg Q, {ports});\n"
+                   f"  initial Q = INIT;\n  always @({sens}) {body}\nendmodule\n")
+    return P
+
+
+PRIMS = _build_prims()
+PRIMS_FILE = "xilinx_prims.v"
+INST_RE = re.compile(r"\b([A-Za-z_]\w*)(?:\s*#\s*\((?:[^()]|\([^()]*\))*\)\s*|\s+)([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?\(")
+END_RE = re.compile(r"\bend(?:module|interface|program)\b")
+
+
+def analyse_modules(files):
+    texts, modules = {}, {}
+    for f in files:
+        if not f["exists"] or f["kind"] not in ("sv", "v"):
+            continue
+        try:
+            t = _strip_comments(Path(f["path"]).read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        texts[f["path"]] = t
+        for m in MOD_DECL.finditer(t):
+            header = t[m.end(): m.end() + 2000]
+            semi = header.find(";")
+            hdr = header[:semi if semi >= 0 else len(header)]
+            # remove parameter list  #( ... )
+            hdr_np = re.sub(r"#\s*\((?:[^()]|\([^()]*\))*\)", "", hdr)
+            ports = bool(re.search(r"\(\s*[^)\s]", hdr_np))
+            plist = _parse_ports(hdr_np)
+            e = END_RE.search(t, m.end())
+            body = t[m.end() + (semi if semi >= 0 else 0): e.start() if e else len(t)]
+            dm = re.search(r"\$dumpfile\s*\(\s*\"([^\"]+)\"", body)
+            params = _parse_params(hdr)
+            line = t.count("\n", 0, m.start() + len(m.group(0)) - len(m.group(0).lstrip())) + 1
+            modules[m.group(1)] = {"name": m.group(1), "file": f["path"], "has_ports": ports,
+                                   "ports": plist, "params": params, "line": line,
+                                   "_body": body, "dumpfile": dm.group(1) if dm else None}
+    for name, info in modules.items():
+        used = {mm.group(1) for mm in INST_RE.finditer(info.pop("_body"))}
+        info["deps"] = sorted(u for u in used if u in modules and u != name)
+        info["prims"] = sorted(u for u in used if u in PRIMS and u not in modules)
+    instantiated = {d for m in modules.values() for d in m["deps"]}
+    for name, info in modules.items():
+        info["instantiated"] = name in instantiated
+    tops = [m for m in modules.values() if not m["instantiated"]]
+    tops.sort(key=lambda m: (m["has_ports"], 0 if re.search(r"tb|test|bench", m["name"], re.I) else 1, m["name"]))
+    dumpfile = next((m["dumpfile"] for m in modules.values() if m["dumpfile"]), None)
+    return sorted(modules.values(), key=lambda m: m["name"]), [m["name"] for m in tops], dumpfile
+
+
+def _balanced(text, start):
+    """Contents of the (...) group starting at text[start] == '('."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i]
+    return text[start + 1:]
+
+
+def _parse_ports(hdr_np):
+    i = hdr_np.find("(")
+    if i < 0:
+        return []
+    out, direction, dtype = [], "", ""
+    for seg in _balanced(hdr_np, i).split(","):
+        seg = " ".join(seg.split())
+        if not seg:
+            continue
+        m = re.match(r"^(input|output|inout|ref)\b\s*(.*)$", seg)
+        if m:
+            direction, rest = m.group(1), m.group(2)
+            dm = re.match(r"^((?:(?:wire|logic|reg|bit|var|signed|unsigned|int|integer|byte)\s*)*(?:\[[^\]]*\]\s*)*)", rest)
+            dtype = dm.group(1).strip() if dm else ""
+        nm = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*(?:=.*)?$", seg)
+        if nm and nm.group(1) not in ("input", "output", "inout", "logic", "wire", "reg"):
+            out.append({"name": nm.group(1), "dir": direction, "type": dtype})
+    return out
+
+
+def _parse_params(hdr):
+    m = re.search(r"#\s*\(", hdr)
+    if not m:
+        return []
+    out = []
+    for seg in _balanced(hdr, m.end() - 1).split(","):
+        pm = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*=\s*(.+)$", " ".join(seg.split()))
+        if pm:
+            out.append({"name": pm.group(1), "default": pm.group(2).strip()})
+    return out
+
+
+def collect_defines(files):
+    out = {}
+    for f in files:
+        if not f["exists"] or f["kind"] == "vhdl":
+            continue
+        try:
+            t = Path(f["path"]).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in re.finditer(r"^\s*`define\s+(\w+)(?:[ \t]+([^\n]*))?", t, re.M):
+            out.setdefault(m.group(1), (m.group(2) or "").strip()[:60])
+    return [{"name": k, "value": v} for k, v in sorted(out.items())]
+
+
+def design_closure(proj, top):
+    """Modules reachable from `top` (inclusive)."""
+    mods = {m["name"]: m for m in proj["modules"]}
+    seen, stack = set(), [top]
+    while stack:
+        n = stack.pop()
+        if n in seen or n not in mods:
+            continue
+        seen.add(n)
+        stack.extend(mods[n]["deps"])
+    return seen, mods
+
+
+def load_project(path):
+    p = Path(os.path.expandvars(path.strip().strip('"'))).expanduser()
+    if not p.exists():
+        raise ValueError(f"Path not found: {p}")
+    p = p.resolve()
+    mpf = None
+    if p.is_file() and p.suffix.lower() == ".mpf":
+        mpf = p
+    elif p.is_dir():
+        mpfs = sorted(p.glob("*.mpf"))
+        if mpfs:
+            mpf = mpfs[0]
+    elif p.is_file() and p.suffix.lower() in HDL_KINDS:
+        p = p.parent
+    else:
+        raise ValueError("Open a Questa .mpf project file, a folder, or an HDL source file.")
+    root = mpf.parent if mpf else p
+    files = parse_mpf(mpf) if mpf else scan_folder(root)
+    if mpf and not files:
+        files = scan_folder(root)
+    for f in files:
+        f["kind"] = HDL_KINDS.get(Path(f["path"]).suffix.lower(), "other")
+        try:
+            f["rel"] = os.path.relpath(f["path"], root).replace("\\", "/")
+        except ValueError:
+            f["rel"] = f["path"]
+    # sidebar grouping: Questa project folders if the .mpf uses them, else real directories
+    use_virtual = any(f.get("vfolder") for f in files)
+    for f in files:
+        if use_virtual:
+            f["group"] = f.get("vfolder", "")
+        else:
+            d = f["rel"].rsplit("/", 1)[0] if "/" in f["rel"] else ""
+            f["group"] = d if not d.startswith("..") else str(Path(f["path"]).parent).replace("\\", "/")
+    modules, tops, dumpfile = analyse_modules(files)
+    proj = {
+        "name": (mpf.stem if mpf else root.name),
+        "root": str(root),
+        "mpf": str(mpf) if mpf else None,
+        "files": files,
+        "modules": modules,
+        "tops": tops,
+        "dumpfile": dumpfile,
+        "defines": collect_defines(files),
+    }
+    recent = [r for r in CONFIG.get("recent", []) if r != str(mpf or root)]
+    CONFIG["recent"] = [str(mpf or root)] + recent[:9]
+    save_config(CONFIG)
+    return proj
+
+
+# --------------------------------------------------------------------------- jobs
+class Job:
+    def __init__(self, kind):
+        self.id = uuid.uuid4().hex[:12]
+        self.kind = kind
+        self.lines = []
+        self.done = False
+        self.ok = None
+        self.vcd = None
+        self.proc = None
+        self.cancelled = False
+        self.started = time.time()
+        self.lock = threading.Lock()
+
+    def log(self, text, cls=""):
+        with self.lock:
+            for ln in str(text).splitlines() or [""]:
+                self.lines.append({"t": ln, "c": cls})
+
+    def snapshot(self, since):
+        with self.lock:
+            return {
+                "id": self.id, "kind": self.kind, "lines": self.lines[since:],
+                "next": len(self.lines), "done": self.done, "ok": self.ok, "vcd": self.vcd,
+                "elapsed": round(time.time() - self.started, 2),
+            }
+
+
+JOBS = {}
+
+
+def _quote(a):
+    return f'"{a}"' if (" " in a or not a) else a
+
+
+def _env():
+    env = os.environ.copy()
+    lic = CONFIG.get("license_file")
+    if lic:
+        env["LM_LICENSE_FILE"] = lic
+        env["SALT_LICENSE_SERVER"] = lic
+    q = find_questa_bin()
+    if q:
+        env["PATH"] = q + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def run_cmd(job, cmd, cwd):
+    if job.cancelled:
+        return -1
+    job.log("$ " + " ".join(_quote(str(c)) for c in cmd), "cmd")
+    kw = {}
+    if IS_WIN:
+        kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    else:
+        kw["start_new_session"] = True
+    try:
+        job.proc = subprocess.Popen(
+            [str(c) for c in cmd], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+            bufsize=1, env=_env(), **kw)
+    except FileNotFoundError:
+        job.log(f"Command not found: {cmd[0]}", "err")
+        return 127
+    for line in job.proc.stdout:
+        job.log(line.rstrip("\r\n"))
+    rc = job.proc.wait()
+    job.proc = None
+    return rc
+
+
+def kill_job(job):
+    job.cancelled = True
+    p = job.proc
+    if not p:
+        return
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=0x08000000)
+        else:
+            os.killpg(p.pid, signal.SIGTERM)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+def _split(flags):
+    import shlex
+    try:
+        return shlex.split(flags or "", posix=not IS_WIN)
+    except ValueError:
+        return (flags or "").split()
+
+
+def _runtime_literal(rt):
+    rt = (rt or "").strip()
+    if not rt or rt in ("-all", "all"):
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(fs|ps|ns|us|ms|s)?$", rt)
+    if not m:
+        raise ValueError(f"Bad run time '{rt}'. Use -all or e.g. 500ns, 20us, 1ms.")
+    return m.group(1) + (m.group(2) or "ns")
+
+
+def _src_files(proj, job, verilog_only=False, top=None):
+    """Files to compile. With `top`, only files defining modules the top needs (plus files with no
+    modules, e.g. defines/packages) - skips board-only wrappers that use FPGA hardware blocks."""
+    keep = None
+    if top and any(m["name"] == top for m in proj["modules"]):
+        need, mods = design_closure(proj, top)
+        defining = {}
+        for m in proj["modules"]:
+            defining.setdefault(m["file"], set()).add(m["name"])
+        keep = {f for f, names in defining.items() if names & need}
+        keep |= {f["path"] for f in proj["files"] if f["path"] not in defining}
+    out = []
+    skipped = 0
+    for f in proj["files"]:
+        if keep is not None and f["path"] not in keep and f["kind"] in ("sv", "v"):
+            skipped += 1
+            continue
+        if not f["exists"]:
+            job.log(f"Warning: missing file {f['path']}", "warn")
+            continue
+        if f["kind"] == "header" or f["kind"] == "other":
+            continue
+        if verilog_only and f["kind"] == "vhdl":
+            job.log(f"Skipping VHDL file (not supported by this backend): {f['rel']}", "warn")
+            continue
+        out.append(f)
+    if skipped:
+        job.log(f"Compiling the {len(out)} file(s) needed by '{top}' ({skipped} unrelated file(s) skipped).", "info")
+    return out
+
+
+def _prims_needed(proj, top=None):
+    if top and any(m["name"] == top for m in proj["modules"]):
+        need, mods = design_closure(proj, top)
+        used = {p for n in need for p in mods[n]["prims"]}
+    else:
+        used = {p for m in proj["modules"] for p in m["prims"]}
+    return sorted(used)
+
+
+def _prims_file(job, proj, top=None):
+    """Write the built-in primitive models if the design needs them. Returns path relative to root."""
+    used = _prims_needed(proj, top)
+    if not used:
+        return None
+    build = Path(proj["root"]) / BUILD_DIR
+    build.mkdir(exist_ok=True)
+    (build / PRIMS_FILE).write_text(
+        "// Behavioural simulation models of Xilinx UNISIM primitives, generated by SV Studio.\n"
+        "// Lets schematic netlists simulate without the Xilinx unisims library.\n`timescale 1ns/1ps\n\n"
+        + "\n".join(PRIMS[n] for n in sorted(PRIMS)), encoding="utf-8")
+    shown = ", ".join(used[:12]) + (" …" if len(used) > 12 else "")
+    job.log(f"Using SV Studio's built-in models for Xilinx primitives: {shown}", "info")
+    return f"{BUILD_DIR}/{PRIMS_FILE}"
+
+
+def _incdirs(proj):
+    dirs = {proj["root"]}
+    for f in proj["files"]:
+        dirs.add(str(Path(f["path"]).parent))
+    return sorted(dirs)
+
+
+def _rel(path, root):
+    try:
+        r = os.path.relpath(path, root)
+        return r.replace("\\", "/") if not r.startswith("..") else path.replace("\\", "/")
+    except ValueError:
+        return path
+
+
+def _dump_target(proj, build, top=None):
+    """Returns (vcd_path_relative_to_root, need_wrapper_dump)."""
+    if top and any(m["name"] == top for m in proj["modules"]):
+        need, mods = design_closure(proj, top)
+        df = next((mods[n]["dumpfile"] for n in sorted(need) if mods[n].get("dumpfile")), None)
+    else:
+        df = proj.get("dumpfile")
+    if df:
+        return df, False
+    return f"{BUILD_DIR}/wave.vcd", True
+
+
+def _write_wrapper(proj, top, build, runtime):
+    vcd_rel, need_dump = _dump_target(proj, build, top)
+    lines = [f"module {WRAPPER_TOP};", f"  {top} {top}();"]
+    if need_dump:
+        lines += ["  initial begin", f'    $dumpfile("{vcd_rel}");', f"    $dumpvars(0, {WRAPPER_TOP});", "  end"]
+    if runtime:
+        lines += [f"  initial begin #{runtime}; $display(\"[SV Studio] run time limit {runtime} reached\"); $finish; end"]
+    lines.append("endmodule")
+    wp = build / "svs_wrapper.sv"
+    wp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return wp, vcd_rel
+
+
+# ---- Questa
+def questa_compile(job, proj):
+    qbin = find_questa_bin()
+    if not qbin:
+        job.log("Questa/ModelSim not found. Set its bin folder in Settings, or choose Verilator/Icarus.", "err")
+        return False
+    root = proj["root"]
+    vlib, vlog, vcom = (str(Path(qbin) / _exe(n)) for n in ("vlib", "vlog", "vcom"))
+    if not (Path(root) / "work" / "_info").exists():
+        if run_cmd(job, [vlib, "work"], root) != 0:
+            return False
+    files = _src_files(proj, job)
+    if not files:
+        job.log("No source files to compile.", "err")
+        return False
+    incs = ["+incdir+" + _rel(d, root) for d in _incdirs(proj)]
+    prims = _prims_file(job, proj)
+    if prims:
+        files = [{"path": str(Path(root) / prims), "kind": "v"}] + files
+    # group consecutive files of the same language to keep compile order
+    groups = []
+    for f in files:
+        lang = "vhdl" if f["kind"] == "vhdl" else "verilog"
+        if groups and groups[-1][0] == lang:
+            groups[-1][1].append(f)
+        else:
+            groups.append((lang, [f]))
+    for lang, grp in groups:
+        paths = [_rel(f["path"], root) for f in grp]
+        if lang == "verilog":
+            cmd = [vlog, "-work", "work"] + incs + _split(CONFIG.get("vlog_flags")) + paths
+        else:
+            cmd = [vcom, "-work", "work"] + _split(CONFIG.get("vcom_flags")) + paths
+        if run_cmd(job, cmd, root) != 0:
+            return False
+    return True
+
+
+def questa_sim(job, proj, top, runtime):
+    qbin = find_questa_bin()
+    root = Path(proj["root"])
+    build = root / BUILD_DIR
+    build.mkdir(exist_ok=True)
+    vcd_rel, need_dump = _dump_target(proj, build, top)
+    rt = _runtime_literal(runtime)
+    do = []
+    if need_dump:
+        do += [f"vcd file {{{vcd_rel}}}", f"vcd add -r /{top}/*"]
+    do += [f"run {rt if rt else '-all'}"]
+    if need_dump:
+        do += ["vcd flush"]
+    do += ["quit -f"]
+    dofile = build / "run.do"
+    dofile.write_text("\n".join(do) + "\n", encoding="utf-8")
+    cmd = [str(Path(qbin) / _exe("vsim")), "-c", "-onfinish", "stop", "-voptargs=+acc"] + \
+          _split(CONFIG.get("vsim_flags")) + ["-do", f"{BUILD_DIR}/run.do", f"work.{top}"]
+    rc = run_cmd(job, cmd, str(root))
+    return rc, root / vcd_rel
+
+
+# ---- Verilator / Icarus (native, or through WSL on Windows)
+def _tool(name, root):
+    """argv prefix for running `name` with cwd=root, plus a path converter for its arguments."""
+    p = shutil.which(name)
+    if p:
+        return [p], (lambda x: x), False
+    if IS_WIN and wsl_tool(name):
+        return [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(root), "-e", name], to_wsl_path, True
+    return None, None, False
+
+
+def _wsl_missing(job, names, pkg):
+    if IS_WIN and wsl_available():
+        job.log(f"{names[0]} is not installed in WSL. Open Ubuntu (WSL) and run:", "err")
+        job.log(f"    sudo apt update && sudo apt install {pkg}", "err")
+        job.log("Then restart SV Studio (or press Save in Settings to re-detect tools).", "err")
+    elif IS_WIN:
+        job.log(f"{names[0]} does not run natively on Windows. Install WSL first: open PowerShell as admin and run", "err")
+        job.log("    wsl --install", "err")
+        job.log(f"reboot, open Ubuntu, run  sudo apt update && sudo apt install {pkg}  and restart SV Studio.", "err")
+        if names[0] == "Verilator":
+            job.log("Or pick Questa / Icarus in the Simulator menu instead.", "err")
+    else:
+        job.log(f"{names[0]} not found on PATH. Install it with:  sudo apt install {pkg}", "err")
+
+
+def verilator_build(job, proj, top, runtime, lint_only=False):
+    root = Path(proj["root"])
+    pre, conv, via_wsl = _tool("verilator", str(root))
+    if not pre:
+        _wsl_missing(job, ["Verilator"], "verilator build-essential")
+        return False, None, False
+    if via_wsl and not lint_only and not wsl_tool("make"):
+        _wsl_missing(job, ["make / g++ (needed to build Verilator simulations)"], "build-essential")
+        return False, None, False
+    if via_wsl:
+        job.log("Running Verilator inside WSL (first build on a Windows drive can take a while)…", "info")
+    build = root / BUILD_DIR
+    build.mkdir(exist_ok=True)
+    files = [conv(_rel(f["path"], str(root))) for f in _src_files(proj, job, verilog_only=True, top=top)]
+    prims = _prims_file(job, proj, top)
+    if prims:
+        files = [conv(prims)] + files
+    incs = ["-I" + conv(_rel(d, str(root))) for d in _incdirs(proj)]
+    flags = _split(CONFIG.get("verilator_flags"))
+    base = pre + ["--timing", "--timescale", "1ns/1ps", "-Wno-fatal", "-Wno-lint", "-Wno-style",
+                  "-Wno-MULTITOP", "-Wno-TIMESCALEMOD"] + incs + flags
+    if lint_only:
+        tops = ["--top-module", top] if top else []
+        return run_cmd(job, base + ["--lint-only"] + tops + files, str(root)) == 0, None, via_wsl
+    wp, vcd_rel = _write_wrapper(proj, top, build, _runtime_literal(runtime))
+    mdir = verilator_mdir(str(root), via_wsl)
+    job.verilator_mdir = mdir
+    stop_cpp = write_stop_handler(mdir, via_wsl)
+    cmd = base + ["--binary", "--trace", "-j", "0", "--top-module", WRAPPER_TOP,
+                  "-Mdir", mdir, "-o", "Vsim", "-CFLAGS", "-DVL_USER_STOP"] + \
+        files + [conv(_rel(str(wp), str(root))), stop_cpp]
+    ok = run_cmd(job, cmd, str(root)) == 0
+    return ok, vcd_rel, via_wsl
+
+
+def verilator_sim(job, proj, top, runtime):
+    ok, vcd_rel, via_wsl = verilator_build(job, proj, top, runtime)
+    if not ok:
+        return 1, None
+    root = Path(proj["root"])
+    mdir = job.verilator_mdir
+    if via_wsl:
+        cmd = [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(str(root)), "-e", f"{mdir}/Vsim"]
+    else:
+        exe = Path(mdir) if Path(mdir).is_absolute() else root / mdir
+        cmd = [str(exe / ("Vsim.exe" if IS_WIN else "Vsim"))]
+    rc = run_cmd(job, cmd, str(root))
+    return rc, root / vcd_rel
+
+
+def icarus_build(job, proj, top, runtime, compile_only=False):
+    root = Path(proj["root"])
+    pre, conv, via_wsl = _tool("iverilog", str(root))
+    if not pre:
+        _wsl_missing(job, ["Icarus Verilog"], "iverilog")
+        if IS_WIN:
+            job.log("(Alternatively install the native Windows build from bleyer.org/icarus and tick 'add to PATH'.)", "err")
+        return False, None
+    build = root / BUILD_DIR
+    build.mkdir(exist_ok=True)
+    files = [conv(_rel(f["path"], str(root))) for f in _src_files(proj, job, verilog_only=True, top=top)]
+    prims = _prims_file(job, proj, top)
+    if prims:
+        files = [conv(prims)] + files
+    incs = ["-I" + conv(_rel(d, str(root))) for d in _incdirs(proj)]
+    if top and compile_only:
+        vcd_rel, extra = None, ["-s", top]
+    elif top:
+        wp, vcd_rel = _write_wrapper(proj, top, build, _runtime_literal(runtime))
+        extra = ["-s", WRAPPER_TOP, conv(_rel(str(wp), str(root)))]
+    else:
+        vcd_rel, extra = None, []
+    cmd = pre + ["-g2012", "-o", f"{BUILD_DIR}/sim.vvp"] + incs + _split(CONFIG.get("iverilog_flags")) + files + extra
+    return run_cmd(job, cmd, str(root)) == 0, vcd_rel
+
+
+def icarus_sim(job, proj, top, runtime):
+    ok, vcd_rel = icarus_build(job, proj, top, runtime)
+    if not ok:
+        return 1, None
+    root = Path(proj["root"])
+    pre, _, _ = _tool("vvp", str(root))
+    rc = run_cmd(job, (pre or ["vvp"]) + ["-n", f"{BUILD_DIR}/sim.vvp"], str(root))
+    return rc, root / vcd_rel
+
+
+ERR_RE = re.compile(r"(\*\* Error|%Error|\berror\b|Fatal)", re.I)
+
+
+def job_worker(job, action, proj, backend, top, runtime):
+    try:
+        root = proj["root"]
+        job.log(f"{APP_NAME} · {action} · backend: {backend} · project: {proj['name']}", "info")
+        if action == "compile":
+            if backend == "questa":
+                ok = questa_compile(job, proj)
+            elif backend == "verilator":
+                ok, _, _ = verilator_build(job, proj, top, runtime, lint_only=True)
+            else:
+                ok, _ = icarus_build(job, proj, top, runtime, compile_only=True)
+            job.ok = ok and not job.cancelled
+        else:
+            if not top:
+                raise ValueError("Choose a top-level module (your testbench) first.")
+            mod = next((m for m in proj["modules"] if m["name"] == top), None)
+            if mod and mod["has_ports"] and backend != "questa":
+                job.log(f"Warning: '{top}' has ports. Pick your testbench as the top module.", "warn")
+            if backend == "questa":
+                if CONFIG.get("compile_before_sim", True):
+                    if not questa_compile(job, proj):
+                        job.ok = False
+                        return
+                rc, vcd = questa_sim(job, proj, top, runtime)
+            elif backend == "verilator":
+                rc, vcd = verilator_sim(job, proj, top, runtime)
+            else:
+                rc, vcd = icarus_sim(job, proj, top, runtime)
+            had_errors = any(ERR_RE.search(l["t"]) and l["c"] != "cmd" and "Errors: 0" not in l["t"]
+                             for l in job.lines[-400:])
+            if vcd and Path(vcd).exists() and Path(vcd).stat().st_mtime >= job.started - 1:
+                job.vcd = str(Path(vcd).resolve())
+            elif vcd and not job.cancelled:
+                job.log(f"No waveform file produced ({vcd}).", "warn")
+            job.ok = not job.cancelled and (rc == 0 or (job.vcd is not None and not had_errors))
+        if job.cancelled:
+            job.log("Stopped by user.", "warn")
+    except Exception as e:
+        job.log(f"Error: {e}", "err")
+        job.ok = False
+    finally:
+        el = time.time() - job.started
+        job.log(("✔ " if job.ok else "✖ ") + f"{action.capitalize()} {'finished' if job.ok else 'failed'} in {el:.1f}s",
+                "done-ok" if job.ok else "done-err")
+        job.done = True
+
+
+# --------------------------------------------------------------------------- helpers
+def browse_dialog(kind, start):
+    """Native file/folder dialog via tkinter in a subprocess (thread-safe)."""
+    code = (
+        "import sys, tkinter as tk\nfrom tkinter import filedialog\n"
+        "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
+        f"k = {kind!r}; s = {start!r} or None\n"
+        "if k == 'dir': p = filedialog.askdirectory(initialdir=s, title='Open project folder')\n"
+        "elif k == 'vcd': p = filedialog.askopenfilename(initialdir=s, title='Open VCD waveform', filetypes=[('VCD', '*.vcd'), ('All', '*.*')])\n"
+        "else: p = filedialog.askopenfilename(initialdir=s, title='Open Questa project', filetypes=[('Questa project', '*.mpf'), ('HDL', '*.sv *.v'), ('All', '*.*')])\n"
+        "sys.stdout.write(p or '')\n"
+    )
+    try:
+        exe = sys.executable
+        if IS_WIN and exe.lower().endswith("pythonw.exe") and Path(exe[:-5] + ".exe").exists():
+            exe = exe[:-5] + ".exe"
+        kw = {"creationflags": 0x08000000} if IS_WIN else {}
+        r = subprocess.run([exe, "-c", code], capture_output=True, text=True, timeout=600, **kw)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "dialog failed")
+        return r.stdout.strip()
+    except Exception as e:
+        raise RuntimeError(f"Native dialog unavailable ({e}). Paste the path instead.")
+
+
+def open_vscode(path, line=None, root=None):
+    code = find_vscode()
+    if not code:
+        raise RuntimeError("VS Code not found. Install it with the 'code' command on PATH, or set it in Settings.")
+    args = [code]
+    if root:
+        args.append(root)
+    if path and line:
+        args += ["-g", f"{path}:{line}"]
+    elif path:
+        args.append(path)
+    kw = {"creationflags": 0x08000000} if IS_WIN else {"start_new_session": True}
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+
+def _allowed(path, root):
+    try:
+        p = Path(path).resolve()
+        r = Path(root).resolve()
+        return p == r or r in p.parents
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- HTTP
+MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon"}
+
+STATE = {"project": None, "last_ping": 0.0}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "SVStudio/" + VERSION
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _host_ok(self):
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return host in ("127.0.0.1", "localhost")
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _api_ok(self):
+        return self.headers.get("X-SVS-Token") == TOKEN
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def do_GET(self):
+        if not self._host_ok():
+            return self._send(403, {"error": "bad host"})
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if not u.path.startswith("/api/"):
+            rel = "index.html" if u.path in ("/", "") else u.path.lstrip("/")
+            f = (STATIC_DIR / rel).resolve()
+            if STATIC_DIR.resolve() not in f.parents or not f.exists():
+                return self._send(404, "not found", "text/plain")
+            data = f.read_bytes()
+            if f.name == "index.html":
+                data = data.replace(b"__SVS_TOKEN__", TOKEN.encode())
+            return self._send(200, data, MIME.get(f.suffix, "application/octet-stream"))
+        if not self._api_ok():
+            return self._send(403, {"error": "forbidden"})
+        try:
+            if u.path == "/api/ping":
+                STATE["last_ping"] = time.time()
+                return self._send(200, {"ok": True})
+            if u.path == "/api/status":
+                STATE["last_ping"] = time.time()
+                return self._send(200, {"tools": tool_status(), "config": CONFIG, "project": STATE["project"]})
+            if u.path == "/api/job":
+                job = JOBS.get(q.get("id"))
+                if not job:
+                    return self._send(404, {"error": "no such job"})
+                return self._send(200, job.snapshot(int(q.get("since", 0))))
+            if u.path == "/api/file":
+                proj = STATE["project"]
+                path = q.get("path", "")
+                if not proj or not _allowed(path, proj["root"]):
+                    return self._send(403, {"error": "File is outside the project folder"})
+                return self._send(200, {"path": path, "text": Path(path).read_text(encoding="utf-8", errors="replace"),
+                                        "mtime": Path(path).stat().st_mtime})
+            if u.path == "/api/vcd":
+                path = q.get("path", "")
+                if not path.lower().endswith(".vcd") or not Path(path).is_file():
+                    return self._send(404, {"error": "VCD not found"})
+                data = Path(path).read_bytes()
+                return self._send(200, data, "text/plain; charset=utf-8")
+        except Exception as e:
+            return self._send(500, {"error": str(e)})
+        return self._send(404, {"error": "unknown endpoint"})
+
+    def do_POST(self):
+        if not self._host_ok() or not self._api_ok():
+            return self._send(403, {"error": "forbidden"})
+        u = urlparse(self.path)
+        try:
+            b = self._body()
+            if u.path == "/api/open":
+                STATE["project"] = load_project(b["path"])
+                return self._send(200, STATE["project"])
+            if u.path == "/api/reload":
+                if not STATE["project"]:
+                    return self._send(400, {"error": "No project open"})
+                STATE["project"] = load_project(STATE["project"]["mpf"] or STATE["project"]["root"])
+                return self._send(200, STATE["project"])
+            if u.path in ("/api/compile", "/api/simulate"):
+                proj = STATE["project"]
+                if not proj:
+                    return self._send(400, {"error": "Open a project first"})
+                proj = STATE["project"] = load_project(proj["mpf"] or proj["root"])  # pick up new files
+                if any(not j.done for j in JOBS.values()):
+                    return self._send(409, {"error": "A job is already running"})
+                job = Job(u.path.rsplit("/", 1)[1])
+                JOBS[job.id] = job
+                threading.Thread(target=job_worker, daemon=True, args=(
+                    job, job.kind, proj, b.get("backend", "questa"), b.get("top"), b.get("runtime", "-all"))).start()
+                return self._send(200, {"id": job.id, "project": proj})
+            if u.path == "/api/stop":
+                for j in JOBS.values():
+                    if not j.done:
+                        kill_job(j)
+                return self._send(200, {"ok": True})
+            if u.path == "/api/save":
+                proj = STATE["project"]
+                if not proj or not _allowed(b["path"], proj["root"]):
+                    return self._send(403, {"error": "File is outside the project folder"})
+                Path(b["path"]).write_text(b["text"], encoding="utf-8", newline="")
+                return self._send(200, {"ok": True, "mtime": Path(b["path"]).stat().st_mtime})
+            if u.path == "/api/mtimes":
+                proj = STATE["project"]
+                out = {}
+                for path in b.get("paths", [])[:200]:
+                    try:
+                        out[path] = Path(path).stat().st_mtime if proj and _allowed(path, proj["root"]) else None
+                    except OSError:
+                        out[path] = None
+                return self._send(200, out)
+            if u.path == "/api/vscode":
+                proj = STATE["project"]
+                open_vscode(b.get("path"), b.get("line"), proj["root"] if proj else None)
+                return self._send(200, {"ok": True})
+            if u.path == "/api/browse":
+                start = STATE["project"]["root"] if STATE["project"] else str(Path.home())
+                return self._send(200, {"path": browse_dialog(b.get("kind", "file"), start)})
+            if u.path == "/api/config":
+                for k, v in b.items():
+                    if k in DEFAULT_CONFIG and k != "recent":
+                        CONFIG[k] = v
+                save_config(CONFIG)
+                with _wsl_lock:
+                    _wsl_cache.clear()
+                return self._send(200, {"config": CONFIG, "tools": tool_status()})
+        except Exception as e:
+            return self._send(400, {"error": str(e)})
+        return self._send(404, {"error": "unknown endpoint"})
+
+
+# --------------------------------------------------------------------------- window
+def _free_port(preferred):
+    for port in list(range(preferred, preferred + 10)) + [0]:
+        try:
+            s = socket.socket()
+            if not IS_WIN:  # ignore sockets in TIME_WAIT from a previous run (Windows doesn't block on those)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            p = s.getsockname()[1]
+            s.close()
+            return p
+        except OSError:
+            continue
+    return 0
+
+
+def open_window(url):
+    """Prefer pywebview (native window), then Edge/Chrome app mode, then the default browser."""
+    try:
+        import webview  # optional: pip install pywebview
+        return ("webview", webview)
+    except Exception:
+        pass
+    cands = []
+    if IS_WIN:
+        pf = [os.environ.get(k, "") for k in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA")]
+        for base in pf:
+            cands += [base + r"\Microsoft\Edge\Application\msedge.exe",
+                      base + r"\Google\Chrome\Application\chrome.exe"]
+    elif platform.system() == "Darwin":
+        cands += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+    else:
+        cands += [shutil.which(n) or "" for n in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge")]
+    for c in cands:
+        if c and Path(c).exists():
+            try:
+                subprocess.Popen([c, f"--app={url}", "--window-size=1500,920"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return ("app", None)
+            except Exception:
+                pass
+    webbrowser.open(url)
+    return ("browser", None)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=f"{APP_NAME} {VERSION}")
+    ap.add_argument("project", nargs="?", help=".mpf file or project folder to open")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-window", action="store_true", help="don't open a window, just print the URL")
+    ap.add_argument("--keep-alive", action="store_true", help="keep running after the window is closed")
+    args = ap.parse_args()
+
+    if sys.stdout is None:  # started with pythonw (no console): log to a file instead
+        log = open(Path.home() / ".svstudio.log", "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = log
+
+    if args.project:
+        try:
+            STATE["project"] = load_project(args.project)
+        except Exception as e:
+            print("Could not open project:", e)
+
+    if IS_WIN:
+        threading.Thread(target=lambda: [wsl_tool(n) for n in ("verilator", "iverilog", "make")], daemon=True).start()
+
+    port = _free_port(args.port)
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    print(f"{APP_NAME} {VERSION} running at {url}  (Ctrl+C to quit)")
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+
+    mode, webview = ("none", None) if args.no_window else open_window(url)
+    try:
+        if mode == "webview":
+            webview.create_window(APP_NAME, url, width=1500, height=920, min_size=(1000, 640))
+            webview.start()
+        else:
+            # exit automatically a few minutes after the UI stops pinging (window closed)
+            while True:
+                time.sleep(2)
+                idle = STATE["last_ping"] and time.time() - STATE["last_ping"] > 180
+                busy = any(not j.done for j in JOBS.values())
+                if idle and not busy and not args.keep_alive and not args.no_window:
+                    print("Window closed - exiting.")
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for j in JOBS.values():
+            if not j.done:
+                kill_job(j)
+        httpd.shutdown()
+
+
+if __name__ == "__main__":
+    main()

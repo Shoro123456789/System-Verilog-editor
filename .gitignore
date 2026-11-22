@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+node_modules/
+# simulator output created inside projects
+.svstudio/
+work/
+obj_dir/
+*.vcd
+*.wlf
+transcript
