@@ -45,7 +45,7 @@ document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => showTab
 /* ---------------------------------------------------------------- tools / status */
 function renderTools() {
   const t = S.tools, chips = $("#toolChips");
-  const items = [["Questa", t.questa], ["Verilator", t.verilator], ["Icarus", t.icarus], ["VS Code", t.vscode]];
+  const items = [["Questa", t.questa], ["Verilator", t.verilator], ["Icarus", t.icarus], ["Vivado", t.vivado], ["VS Code", t.vscode]];
   chips.innerHTML = items.map(([n, p]) => `<span class="chip ${p ? "on" : ""}" title="${esc(p || "not found")}">${n}</span>`).join("");
   const sel = $("#selBackend");
   [["questa", t.questa], ["verilator", t.verilator], ["icarus", t.icarus]].forEach(([v, p]) => {
@@ -266,7 +266,7 @@ function setRunning(on, kind) {
   $("#btnCompile").disabled = on;
   const chip = $("#jobChip");
   chip.className = "job-chip" + (on ? " running" : "");
-  if (on) chip.textContent = kind === "compile" ? "Compiling…" : kind === "board" ? "Building board…" : "Simulating…";
+  if (on) chip.textContent = kind === "compile" ? "Compiling…" : kind === "board" ? "Building board…" : kind === "timing" ? "Running Vivado…" : "Simulating…";
 }
 
 async function startJob(kind) {
@@ -303,6 +303,14 @@ async function poll() {
         chip.textContent = (r.ok ? "Board live" : "Board build failed") + ` · ${r.elapsed}s`;
         status(r.ok ? "Virtual lab board running" : "Board build failed" + (S.errors ? ` · ${S.errors} error(s)` : ""));
         if (window.onBoardBuilt) window.onBoardBuilt(r.ok);
+        return;
+      }
+      if (r.kind === "timing") {
+        const chip = $("#jobChip");
+        chip.className = "job-chip " + (r.ok ? "ok" : "fail");
+        chip.textContent = (r.ok ? "Timing done" : "Vivado failed") + ` · ${r.elapsed}s`;
+        status(r.ok ? `Timing analysis finished in ${r.elapsed}s` : "Vivado run failed" + (S.errors ? ` · ${S.errors} error(s)` : ""));
+        if (window.onTimingDone) window.onTimingDone(r.ok);
         return;
       }
       const chip = $("#jobChip");

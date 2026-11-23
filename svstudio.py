@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "vsim_flags": "",
     "verilator_flags": "",
     "iverilog_flags": "",
+    "vivado_path": "",          # vivado / vivado.bat (auto-detected if empty)
     "compile_before_sim": True,
     "recent": [],
 }
@@ -317,6 +318,7 @@ def tool_status():
         "verilator": _tool_label("verilator"),
         "icarus": _tool_label("iverilog"),
         "vscode": find_vscode(),
+        "vivado": find_vivado(),
         "platform": platform.system(),
         "version": VERSION,
     }
@@ -676,7 +678,7 @@ def _env():
     return env
 
 
-def run_cmd(job, cmd, cwd):
+def run_cmd(job, cmd, cwd, transform=None):
     if job.cancelled:
         return -1
     job.log("$ " + " ".join(_quote(str(c)) for c in cmd), "cmd")
@@ -694,7 +696,8 @@ def run_cmd(job, cmd, cwd):
         job.log(f"Command not found: {cmd[0]}", "err")
         return 127
     for line in job.proc.stdout:
-        job.log(line.rstrip("\r\n"))
+        line = line.rstrip("\r\n")
+        job.log(transform(line) if transform else line)
     rc = job.proc.wait()
     job.proc = None
     return rc
@@ -1235,6 +1238,397 @@ def parse_memfile(path):
     return out
 
 
+# --------------------------------------------------------------------------- FPGA timing (Vivado)
+# Runs the same Vivado flow as the lab build script (synth -> place -> route on the board's
+# Spartan-7) and reports static timing, or reads the timing summary out of a lab build log.
+FPGA_PART = "xc7s25ftgb196-1"
+LAB_XDC_DIR = "/cadtools5/questa_custom/resource/comp12111"   # on the Tootill lab machines
+
+
+def find_vivado():
+    p = (CONFIG.get("vivado_path") or "").strip().strip('"')
+    if p:
+        pp = Path(p)
+        if pp.is_dir():
+            for c in ("bin/vivado.bat", "bin/vivado", "vivado.bat", "vivado"):
+                if (pp / c).exists():
+                    return str(pp / c)
+        elif pp.exists():
+            return str(pp)
+    w = shutil.which("vivado")
+    if w:
+        return w
+    if IS_WIN:
+        pats = ["C:/Xilinx/Vivado/*/bin/vivado.bat", "C:/Xilinx/*/Vivado/bin/vivado.bat",
+                "C:/AMDDesignTools/*/Vivado/bin/vivado.bat", "D:/Xilinx/Vivado/*/bin/vivado.bat"]
+    else:
+        pats = ["/tools/Xilinx/Vivado/*/bin/vivado", "/tools/Xilinx/*/Vivado/bin/vivado",
+                "/opt/Xilinx/Vivado/*/bin/vivado", "/opt/Xilinx/*/Vivado/bin/vivado",
+                str(Path.home() / "Xilinx/Vivado/*/bin/vivado"), "/cadtools5/Xilinx_Vivado_*/Vivado/*/bin/vivado"]
+    hits = []
+    for pat in pats:
+        hits += glob.glob(pat)
+
+    def ver(h):
+        return [int(x) for x in re.findall(r"(\d{4})\.(\d)", h.replace("\\", "/"))[-1]] if re.search(r"\d{4}\.\d", h) else [0]
+    hits.sort(key=ver)
+    return hits[-1] if hits else None
+
+
+SYNTH_HINTS = {
+    "Synth 8-327": "Latch inferred: a combinational block doesn't assign this signal on every path. Add a default value or an else/default branch.",
+    "Synth 8-7137": "Usually caused by mixing blocking (=) and non-blocking (<=) assignments to the same register in an always_ff block.",
+    "Synth 8-3352": "Multi-driven net: the signal is assigned in more than one place.",
+    "Synth 8-689": "Port width mismatch in an instance connection.",
+    "Synth 8-7023": "An instance leaves some ports unconnected.",
+    "Synth 8-6014": "Register removed because its output is never used.",
+    "Synth 8-3332": "Register removed because its output is never used.",
+    "Synth 8-3848": "Net has no driver - it will be tied to a constant.",
+    "Synth 8-3917": "Output pin driven by a constant. Normal for board outputs your design doesn't use.",
+    "Synth 8-7129": "Input pin not used. Normal for board inputs your design doesn't use.",
+    "Synth 8-4446": "Instance outputs unconnected. Normal for unused parts of the board wrapper.",
+    "Synth 8-155": "case statement without a default branch.",
+    "Synth 8-567": "Signal read in a combinational block but missing from the sensitivity list.",
+}
+
+VIV_MSG_RE = re.compile(r"^(CRITICAL WARNING|WARNING|ERROR): \[([^\]]+)\] (.*?)(?: \[([^\[\]]+?):(\d+)\])?\s*$")
+
+
+def _map_src(path, proj):
+    """Map a path from a Vivado log (possibly from a lab machine) to a project file."""
+    if not path:
+        return None
+    p = path.replace("\\", "/")
+    by_rel = {f["rel"].lower(): f for f in proj["files"]}
+    for f in proj["files"]:
+        if f["path"].replace("\\", "/").lower() == p.lower():
+            return f
+    parts = p.split("/")
+    for i in range(1, len(parts)):
+        f = by_rel.get("/".join(parts[i:]).lower())
+        if f:
+            return f
+    base = parts[-1].lower()
+    same = [f for f in proj["files"] if Path(f["path"]).name.lower() == base]
+    return same[0] if len(same) == 1 else None
+
+
+def _board_lib_files(proj):
+    if not any(m["name"] == BOARD_MODULE for m in proj["modules"]):
+        return set()
+    need, mods = design_closure(proj, BOARD_MODULE)
+    return {mods[n]["file"] for n in need}
+
+
+def parse_vivado_messages(text, proj):
+    lib = _board_lib_files(proj)
+    out, seen = [], set()
+    for line in text.splitlines():
+        m = VIV_MSG_RE.match(line.strip())
+        if not m:
+            continue
+        sev, mid, msg, fpath, ln = m.groups()
+        key = (sev, mid, msg, fpath, ln)
+        if key in seen:
+            continue
+        seen.add(key)
+        f = _map_src(fpath, proj) if fpath else None
+        out.append({"sev": "error" if sev == "ERROR" else "critical" if sev.startswith("CRITICAL") else "warning",
+                    "id": mid, "msg": msg, "file": f["path"] if f else fpath, "rel": f["rel"] if f else None,
+                    "line": int(ln) if ln else None, "user": bool(f) and f["path"] not in lib,
+                    "hint": SYNTH_HINTS.get(mid)})
+    rank = {"error": 0, "critical": 1, "warning": 2}
+    out.sort(key=lambda w: (rank[w["sev"]], not w["user"], w["id"], w["rel"] or "", w["line"] or 0))
+    return out
+
+
+def _vivado_line_transform(proj):
+    """Rewrite Vivado messages so file references become project-relative (clickable, go to Problems)."""
+    def tf(line):
+        m = VIV_MSG_RE.match(line.strip())
+        if m and m.group(4):
+            f = _map_src(m.group(4), proj)
+            loc = f["rel"] if f else Path(m.group(4)).name
+            return f"{m.group(1)}: [{m.group(2)}] {m.group(3)}  {loc}:{m.group(5)}"
+        return line
+    return tf
+
+
+def parse_timing_summary(text):
+    r = {}
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if "WNS(ns)" in ln and "TNS(ns)" in ln:
+            for nxt in lines[i + 1:i + 5]:
+                vals = nxt.split()
+                if len(vals) >= 8 and re.fullmatch(r"-?[\d.]+|NA", vals[0]):
+                    num = lambda v: None if v == "NA" else float(v)
+                    r.update(wns=num(vals[0]), tns=num(vals[1]), tns_fail=int(vals[2]), tns_total=int(vals[3]),
+                             whs=num(vals[4]), ths=num(vals[5]), ths_fail=int(vals[6]), ths_total=int(vals[7]))
+                    if len(vals) >= 9:
+                        r["wpws"] = num(vals[8])
+                    break
+            break
+    clocks, in_clk = [], False
+    for ln in lines:
+        if re.match(r"^\s*Clock\s+Waveform\(ns\)\s+Period\(ns\)", ln):
+            in_clk = True
+            continue
+        if in_clk:
+            m = re.match(r"^\s*(\S+)\s+\{([^}]*)\}\s+([\d.]+)\s+([\d.]+)", ln)
+            if m:
+                clocks.append({"name": m.group(1), "period": float(m.group(3)), "freq": float(m.group(4))})
+            elif clocks and not ln.strip():
+                in_clk = False
+    r["clocks"] = clocks
+    r["checks"] = []
+    for ln in lines:
+        m = re.match(r"^\s*There (?:is|are) (\d+) (.+?)\.?\s*(?:\(HIGH\)|\(MEDIUM\)|\(LOW\))?\s*$", ln)
+        if m and int(m.group(1)) > 0 and not re.search(r"(input|output) delay", m.group(2)):
+            r["checks"].append(f"{m.group(1)} {m.group(2)}")
+    if "All user specified timing constraints are met" in text:
+        r["met"] = True
+    elif "Timing constraints are not met" in text:
+        r["met"] = False
+    return r
+
+
+def parse_utilization(text):
+    want = {"Slice LUTs": "lut", "Slice Registers": "ff", "Block RAM Tile": "bram", "Bonded IOB": "io", "DSPs": "dsp"}
+    out = {}
+    for ln in text.splitlines():
+        cells = [c.strip() for c in ln.split("|")]
+        if len(cells) > 6 and cells[1].rstrip("*") in want and want[cells[1].rstrip("*")] not in out:
+            try:
+                out[want[cells[1].rstrip("*")]] = {"used": float(cells[2]), "avail": float(cells[-3]) if cells[-3] else None,
+                                                   "pct": float(cells[-2]) if cells[-2] else None}
+            except ValueError:
+                pass
+    return out
+
+
+def parse_paths(text):
+    out = []
+    for ln in text.splitlines():
+        c = ln.split("\t")
+        if len(c) < 11:
+            continue
+        def f(v):
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        out.append({"kind": "setup" if c[0] == "max" else "hold", "slack": f(c[1]), "from": c[2], "to": c[3],
+                    "delay": f(c[4]), "levels": int(c[5]) if c[5].isdigit() else None, "sclk": c[6], "eclk": c[7],
+                    "req": f(c[8]), "smod": c[9], "emod": c[10]})
+    return out
+
+
+def _timing_dir(proj, top):
+    return Path(proj["root"]) / BUILD_DIR / "timing" / re.sub(r"\W+", "_", top)
+
+
+def read_run_results(proj, top):
+    d = _timing_dir(proj, top)
+    summ = d / "timing_summary.rpt"
+    log = d / "vivado.log"
+    if not log.exists():
+        return None
+    res = {"source": "run", "dir": str(d), "log": str(log), "when": log.stat().st_mtime, "completed": summ.exists(),
+           "part": FPGA_PART}
+    if summ.exists():
+        res.update(parse_timing_summary(summ.read_text(errors="replace")))
+    if (d / "utilization.rpt").exists():
+        res["util"] = parse_utilization((d / "utilization.rpt").read_text(errors="replace"))
+    if (d / "paths.tsv").exists():
+        res["paths"] = parse_paths((d / "paths.tsv").read_text(errors="replace"))
+    if (d / "constraints.txt").exists():
+        res["constraints"] = (d / "constraints.txt").read_text(errors="replace").strip()
+    res["messages"] = parse_vivado_messages(log.read_text(errors="replace"), proj)
+    return res
+
+
+def read_lab_results(proj, top):
+    """Timing summary from the lab's own Vivado build (synthesis/<top>/vivado*.log)."""
+    logs = [Path(p) for p in glob.glob(str(Path(proj["root"]) / "synthesis" / top / "vivado*.log"))]
+    logs = [p for p in logs if p.stat().st_size > 2000]
+    if not logs:
+        return None
+    logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    best = None
+    for p in logs:
+        t = p.read_text(errors="replace")
+        m = None
+        for m in re.finditer(r"Post Routing Timing Summary \| WNS=(-?[\d.]+)\s*\| TNS=(-?[\d.]+)\s*\| WHS=(-?[\d.]+|N/A)\s*\| THS=(-?[\d.]+|N/A)", t):
+            pass
+        if m or best is None:
+            best = (p, t, m)
+        if m:
+            break
+    p, t, m = best
+    num = lambda v: None if v in (None, "N/A") else float(v)
+    res = {"source": "lab", "log": str(p), "when": p.stat().st_mtime, "completed": bool(m), "part": FPGA_PART,
+           "messages": parse_vivado_messages(t, proj)}
+    dm = re.search(r"Start of session at:\s*(.+)", t) or re.search(r"\| Date\s*:\s*(.+)", t)
+    if dm:
+        res["date"] = dm.group(1).strip()
+    if m:
+        res.update(wns=num(m.group(1)), tns=num(m.group(2)), whs=num(m.group(3)), ths=num(m.group(4)))
+        res["met"] = (res["wns"] is None or res["wns"] >= 0) and (res["whs"] is None or res["whs"] >= 0)
+    return res
+
+
+def physical_xdc(proj):
+    """Pin constraints: from a lab post_route_io.rpt in the project if there is one, else SV Studio's copy."""
+    rpts = sorted(glob.glob(str(Path(proj["root"]) / "synthesis" / "*" / "post_route_io.rpt")),
+                  key=lambda p: Path(p).stat().st_mtime, reverse=True)
+    for rp in rpts:
+        x = xdc_from_io_report(Path(rp).read_text(errors="replace"))
+        if x:
+            return x, _rel(rp, proj["root"])
+    return (BOARD_DIR / "BoardV3_physical.xdc").read_text(encoding="utf-8"), "SV Studio's built-in board pinout"
+
+
+def xdc_from_io_report(text):
+    hdr, out = None, []
+    for ln in text.splitlines():
+        if not ln.startswith("|"):
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if cells and cells[0] == "Pin Number":
+            hdr = cells
+            continue
+        if not hdr or len(cells) != len(hdr):
+            continue
+        row = dict(zip(hdr, cells))
+        sig = row.get("Signal Name", "")
+        if not sig or row.get("Use") not in ("INPUT", "OUTPUT", "BIDIR"):
+            continue
+        props = [f"PACKAGE_PIN {row['Pin Number']}"]
+        if row.get("IO Standard"):
+            props.append(f"IOSTANDARD {row['IO Standard']}")
+        if row.get("Pull Type") in ("PULLUP", "PULLDOWN", "KEEPER"):
+            props.append(f"PULLTYPE {row['Pull Type']}")
+        out.append(f"set_property -dict {{{' '.join(props)}}} [get_ports {{{sig}}}]")
+    if not out:
+        return None
+    return "# Board pinout (generated by SV Studio from a lab post_route_io.rpt)\n" + "\n".join(out) + \
+        "\nset_property CONFIG_VOLTAGE 3.3 [current_design]\nset_property CFGBVS VCCO [current_design]\n"
+
+
+TIMING_XDC = """# Timing constraints (SV Studio). The board clock is 100 MHz on pin Clk.
+create_clock -period 10.000 -name Clk [get_ports Clk]
+# On this board Clk isn't on a clock-capable pin, so (like the lab build) allow general routing to the BUFG
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet Clk_IBUF]
+# Clocks made by dividing Clk in BoardLib (Clocks.v) and by Ackie (proc_clk for MU0)
+foreach {name pat div} {Clk_25MHz */Clk_25MHz_reg/Q 4  Clk_1kHz */Clk_1kHz_reg/Q 100000  Clk_1Hz */Clk_1Hz_reg/Q 100000000  proc_clk */proc_clk_reg/Q 32} {
+  set p [get_pins -quiet -hierarchical -filter "NAME =~ $pat"]
+  if {[llength $p]} { create_generated_clock -name $name -source [get_ports Clk] -divide_by $div [lindex $p 0] }
+}
+# Buttons, switches and displays are slow, asynchronous board signals
+set_false_path -from [get_ports -filter {DIRECTION != OUT && NAME != Clk}]
+set_false_path -to [get_ports -filter {DIRECTION != IN}]
+"""
+
+TIMING_TCL_TAIL = r"""
+opt_design
+power_opt_design
+place_design -directive Explore
+route_design -directive Explore
+report_timing_summary -max_paths 10 -report_unconstrained -file timing_summary.rpt
+report_utilization -file utilization.rpt
+proc svs_mod {pin} {
+  if {[catch {
+    set c [get_cells -quiet -of_objects [get_pins -quiet $pin]]
+    if {$c eq ""} { return "" }
+    set par [get_property PARENT $c]
+    if {$par eq ""} { return [get_property TOP [current_design]] }
+    set pc [get_cells -quiet $par]
+    set r [get_property ORIG_REF_NAME $pc]
+    if {$r eq ""} { set r [get_property REF_NAME $pc] }
+  } err]} { return "" }
+  return $r
+}
+set fh [open paths.tsv w]
+foreach kind {max min} {
+  foreach p [get_timing_paths -quiet -delay_type $kind -max_paths 10 -nworst 1 -sort_by slack] {
+    set sp [get_property STARTPOINT_PIN $p]
+    set ep [get_property ENDPOINT_PIN $p]
+    puts $fh [join [list $kind [get_property SLACK $p] $sp $ep [get_property DATAPATH_DELAY $p] \
+      [get_property LOGIC_LEVELS $p] [get_property STARTPOINT_CLOCK $p] [get_property ENDPOINT_CLOCK $p] \
+      [get_property REQUIREMENT $p] [svs_mod $sp] [svs_mod $ep]] "\t"]
+  }
+}
+close $fh
+puts "SVS_TIMING_DONE"
+exit
+"""
+
+
+def _tcl_path(p):
+    return "{" + str(p).replace("\\", "/") + "}"
+
+
+def timing_worker(job, proj, top):
+    try:
+        job.log(f"{APP_NAME} · FPGA timing (Vivado) · {top} · part {FPGA_PART}", "info")
+        viv = find_vivado()
+        if not viv:
+            job.log("Vivado not found. Install Vivado (the free ML Standard edition covers Spartan-7) or set its path in Settings.", "err")
+            job.ok = False
+            return
+        need, mods = design_closure(proj, top)
+        files = [f for f in proj["files"] if f["exists"] and f["kind"] in ("sv", "v")
+                 and any(mods[n]["file"] == f["path"] for n in need)]
+        d = _timing_dir(proj, top)
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+        # $readmemh files are looked up relative to the run directory in synthesis
+        for dp, dn, fn in os.walk(proj["root"]):
+            dn[:] = [x for x in dn if x not in SKIP_DIRS and not x.startswith(".")]
+            for f in fn:
+                if f.lower().endswith((".mem", ".hex")):
+                    try:
+                        shutil.copyfile(Path(dp, f), d / f)
+                    except OSError:
+                        pass
+        lab_t, lab_p = Path(LAB_XDC_DIR, "BoardV3_timing.xdc"), Path(LAB_XDC_DIR, "BoardV3_physical.xdc")
+        if lab_t.exists() and lab_p.exists():
+            xdcs, note = [lab_t, lab_p], f"the lab's constraint files ({LAB_XDC_DIR})"
+        else:
+            phys, src = physical_xdc(proj)
+            (d / "board_timing.xdc").write_text(TIMING_XDC, encoding="utf-8")
+            (d / "board_pins.xdc").write_text(phys, encoding="utf-8")
+            xdcs, note = [d / "board_timing.xdc", d / "board_pins.xdc"], f"Clk = 100 MHz, pins from {src}"
+        (d / "constraints.txt").write_text(note, encoding="utf-8")
+        job.log(f"Constraints: {note}", "info")
+        incs = " ".join(_tcl_path(x) for x in _incdirs(proj))
+        tcl = [f"set_param general.maxThreads {max(1, min(8, os.cpu_count() or 2))}"]
+        for f in files:
+            tcl.append(f"read_verilog {'-sv ' if f['kind'] == 'sv' else ''}{_tcl_path(f['path'])}")
+        tcl.append(f"synth_design -top {top} -part {FPGA_PART} -fsm_extraction off -include_dirs [list {incs}]")
+        tcl += [f"read_xdc {_tcl_path(x)}" for x in xdcs]
+        (d / "run.tcl").write_text("\n".join(tcl) + "\n" + TIMING_TCL_TAIL, encoding="utf-8")
+        job.log(f"Running Vivado on {len(files)} files: synthesis, place and route. This takes a few minutes…", "info")
+        rc = run_cmd(job, [viv, "-mode", "batch", "-source", "run.tcl", "-nojournal", "-log", "vivado.log", "-notrace"],
+                     str(d), transform=_vivado_line_transform(proj))
+        job.ok = rc == 0 and (d / "timing_summary.rpt").exists() and not job.cancelled
+        if job.ok:
+            r = read_run_results(proj, top)
+            if r.get("wns") is not None:
+                job.log(f"Timing: WNS {r['wns']:.3f} ns · WHS {r.get('whs') or 0:.3f} ns · "
+                        + ("all constraints met" if r.get("met") else "NOT met"), "info" if r.get("met") else "warn")
+    except Exception as e:
+        job.log(f"Error: {e}", "err")
+        job.ok = False
+    finally:
+        el = time.time() - job.started
+        job.log(("✔ Timing analysis finished" if job.ok else "✖ Timing analysis failed") + f" in {el:.1f}s",
+                "done-ok" if job.ok else "done-err")
+        job.done = True
+
+
 ERR_RE = re.compile(r"(\*\* Error|%Error|\berror\b|Fatal)", re.I)
 
 
@@ -1398,6 +1792,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not job:
                     return self._send(404, {"error": "no such job"})
                 return self._send(200, job.snapshot(int(q.get("since", 0))))
+            if u.path == "/api/timing/info":
+                proj = STATE["project"]
+                if not proj:
+                    return self._send(400, {"error": "Open a project first"})
+                top = q.get("top", "")
+                return self._send(200, {"vivado": find_vivado(), "part": FPGA_PART,
+                                        "run": read_run_results(proj, top) if top else None,
+                                        "lab": read_lab_results(proj, top) if top else None})
             if u.path == "/api/board/memfiles":
                 proj = STATE["project"]
                 files = []
@@ -1472,6 +1874,20 @@ class Handler(BaseHTTPRequestHandler):
                 job = Job("board")
                 JOBS[job.id] = job
                 threading.Thread(target=board_worker, daemon=True, args=(job, proj, top)).start()
+                return self._send(200, {"id": job.id, "project": proj})
+            if u.path == "/api/timing/run":
+                proj = STATE["project"]
+                if not proj:
+                    return self._send(400, {"error": "Open a project first"})
+                proj = STATE["project"] = load_project(proj["mpf"] or proj["root"])
+                if any(not j.done for j in JOBS.values()):
+                    return self._send(409, {"error": "A job is already running"})
+                top = b.get("top") or ""
+                if not any(m["name"] == top for m in proj["modules"]):
+                    return self._send(400, {"error": "Pick the design to analyse"})
+                job = Job("timing")
+                JOBS[job.id] = job
+                threading.Thread(target=timing_worker, daemon=True, args=(job, proj, top)).start()
                 return self._send(200, {"id": job.id, "project": proj})
             if u.path == "/api/board/cmd":
                 sess = BOARD["session"]

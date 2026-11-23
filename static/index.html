@@ -66,6 +66,7 @@
       <button data-tab="wave">Waveform <span class="badge info" id="waveBadge" hidden></span></button>
       <button data-tab="editor">Editor <span class="badge dim" id="editorBadge" hidden></span></button>
       <button data-tab="board">Board <span class="badge info" id="boardBadge" hidden>live</span></button>
+      <button data-tab="timing">Timing <span class="badge" id="timingBadge" hidden></span></button>
     </nav>
 
     <section class="tab active" id="tab-console">
@@ -220,6 +221,28 @@
       </div>
     </section>
 
+    <section class="tab" id="tab-timing">
+      <div class="board-bar">
+        <label class="field"><span>Design</span><select id="selTimTop"><option value="">—</option></select></label>
+        <button class="btn primary sm" id="tmRun" title="Synthesise, place and route with Vivado for the lab board's Spartan-7, then run static timing analysis">
+          <svg viewBox="0 0 24 24"><path class="fill" d="M7 4l13 8-13 8z"/></svg><span>Run Vivado</span></button>
+        <button class="btn sm" id="tmReload" title="Re-read results">Refresh</button>
+        <div class="seg-toggle" id="tmSource" hidden>
+          <button data-src="run" class="active">This PC</button><button data-src="lab">Lab build</button>
+        </div>
+        <div class="spacer"></div>
+        <span class="job-chip" id="tmVivado">Vivado: checking…</span>
+      </div>
+      <div class="board-body" id="tmBody">
+        <div class="board-empty" id="tmEmpty">
+          <h3>FPGA timing</h3>
+          <p>Press <b>Run Vivado</b> to build the design for the lab board's Spartan-7 (<code>xc7s25ftgb196-1</code>) and check every path against the 100&nbsp;MHz clock.</p>
+          <p class="muted small">If you've already built the design in the lab, SV Studio also reads the timing summary and warnings from <code>synthesis/&lt;design&gt;/vivado.log</code>, so you can see them here without Vivado.</p>
+        </div>
+        <div id="tmResult" hidden></div>
+      </div>
+    </section>
+
     <section class="tab" id="tab-editor">
       <div class="editor-bar">
         <div class="ed-tabs" id="edTabs"></div>
@@ -274,6 +297,7 @@
       <label>Extra vlog flags<input data-cfg="vlog_flags" placeholder="e.g. -timescale 1ns/1ps +define+SIM"></label>
       <label>Extra vcom flags<input data-cfg="vcom_flags"></label>
       <label>Extra vsim flags<input data-cfg="vsim_flags" placeholder="e.g. -t ps"></label>
+      <label>Vivado executable<input data-cfg="vivado_path" placeholder="auto-detect, e.g. C:\Xilinx\Vivado\2024.1\bin\vivado.bat"></label>
       <label>Extra Verilator flags<input data-cfg="verilator_flags"></label>
       <label>Extra iverilog flags<input data-cfg="iverilog_flags"></label>
       <label class="check"><input type="checkbox" data-cfg="compile_before_sim"> Compile before every simulation (Questa)</label>
@@ -299,5 +323,6 @@
 <script src="wave.js"></script>
 <script src="app.js"></script>
 <script src="board.js"></script>
+<script src="timing.js"></script>
 </body>
 </html>

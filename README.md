@@ -104,6 +104,27 @@ keypad and displays. Your files aren't changed. The simulation is functional (no
 UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colours for
 `Crossing_A`, and which end Digit0 sits at, are assumptions; each lamp is labelled with its bit.
 
+## FPGA timing (Vivado)
+
+The **Timing** tab shows whether a design meets timing on the lab board's Spartan-7
+(`xc7s25ftgb196-1`, 100 MHz `Clk`):
+
+- **Run Vivado** synthesises, places and routes the design with the same steps as the lab build
+  script, then runs static timing analysis. It shows setup/hold slack (WNS/TNS/WHS/THS), a rough
+  maximum clock speed, the clocks, resources used, the worst paths (click a register to jump to it)
+  and every synthesis warning, with your own code first and plain-English hints. Warnings in your
+  files also appear under **Problems**. It needs Vivado: the free ML Standard edition supports
+  Spartan-7. Vivado is found automatically in the usual install folders, or you can set its path in
+  Settings. Reports are kept in `.svstudio/timing/<design>/`.
+- **Without Vivado**, if you've built the design in the lab, SV Studio reads the timing summary and
+  warnings from `synthesis/<design>/vivado.log`. Switch between *This PC* and *Lab build* when you
+  have both.
+- **Constraints:** on the lab machines the lab's own `.xdc` files are used. Elsewhere SV Studio uses
+  a 100 MHz clock on `Clk`, generated clocks for `Clk_25MHz`, `Clk_1kHz`, `Clk_1Hz` and `proc_clk`,
+  and false paths on the asynchronous board I/O. Pin locations come from a lab `post_route_io.rpt`,
+  or from SV Studio's built-in copy of the board pinout. These approximate the lab's timing
+  constraints, which aren't public, so the numbers can differ slightly from a lab build.
+
 ## Settings (⚙)
 
 - **Questa bin folder:** set this if Questa isn't auto-detected, e.g. `C:\altera_lite\25.1std\questa_fse\win64` or `C:\intelFPGA_lite\23.1std\questa_fse\win64`.
