@@ -74,6 +74,7 @@ module BoardV3 (
     input  wire        bp_mem_data_read
 );
 
+`ifdef VERILATOR
   import "DPI-C" function void svs_board_tick(
       input int d0, input int d1, input int d2, input int d3, input int d4, input int d5,
       input int lights, input int leds, input int dac,
@@ -81,6 +82,7 @@ module BoardV3 (
       input int p_fetch, input int p_halted, input int p_din, input int p_cc, input int m_din,
       output int o_buttons, output int o_simple, output int o_slow,
       output int o_pclk, output int o_prst, output int o_maddr, output int o_mwen, output int o_mdout);
+`endif
 
   initial begin
     Clk_1Hz = 1'b0; Clk_1kHz = 1'b0; button = 24'd0; Simple_buttons = 4'd0;
@@ -109,6 +111,7 @@ module BoardV3 (
   int t_buttons, t_simple, t_slow, t_pclk, t_prst, t_maddr, t_mwen, t_mdout;
   always @(posedge Clk) begin
     if (div == 2'd0) begin
+`ifdef VERILATOR
       svs_board_tick({17'd0, Digit0}, {17'd0, Digit1}, {17'd0, Digit2},
                      {17'd0, Digit3}, {17'd0, Digit4}, {17'd0, Digit5},
                      {21'd0, Crossing_A, Crossing_B}, {30'd0, S7_leds}, {20'd0, dac_data},
@@ -116,6 +119,15 @@ module BoardV3 (
                      {31'd0, proc_fetch}, {31'd0, proc_halted}, {16'd0, proc_din}, {28'd0, proc_cc},
                      {16'd0, mem_din},
                      t_buttons, t_simple, t_slow, t_pclk, t_prst, t_maddr, t_mwen, t_mdout);
+`else   // Icarus Verilog: the same exchange through SV Studio's VPI module (svs_board.vpi)
+      $svs_board_tick({17'd0, Digit0}, {17'd0, Digit1}, {17'd0, Digit2},
+                      {17'd0, Digit3}, {17'd0, Digit4}, {17'd0, Digit5},
+                      {21'd0, Crossing_A, Crossing_B}, {30'd0, S7_leds}, {20'd0, dac_data},
+                      bz_period, bz_cnt,
+                      {31'd0, proc_fetch}, {31'd0, proc_halted}, {16'd0, proc_din}, {28'd0, proc_cc},
+                      {16'd0, mem_din},
+                      t_buttons, t_simple, t_slow, t_pclk, t_prst, t_maddr, t_mwen, t_mdout);
+`endif
       button         <= t_buttons[23:0];
       Simple_buttons <= t_simple[3:0];
       Clk_1Hz        <= t_slow[0];

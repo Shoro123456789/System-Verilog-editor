@@ -43,7 +43,7 @@ below is optional extra setup.
    `SV Studio (debug console).bat` to see why.
 
 ### 2. Simulators (optional: Icarus is already built in)
-- **Verilator** is faster, and it's needed for the **Board** tab. It runs inside WSL:
+- **Verilator** is much faster (the **Board** tab runs about 50x faster with it). It runs inside WSL:
   1. Open PowerShell **as Administrator**, run `wsl --install`, and restart the PC.
   2. Open **Ubuntu** from the Start menu, create a user, then run:
      ```bash
@@ -80,7 +80,7 @@ built-in Icarus works, and you can download the repo as a ZIP instead of using g
 
 ### 2. Simulators (optional: Icarus is already built in)
 ```bash
-sudo apt install -y verilator build-essential       # Verilator: faster, and needed for the Board tab
+sudo apt install -y verilator build-essential       # Verilator: faster simulations and a ~50x faster Board tab
 sudo apt install -y iverilog                         # optional: a system Icarus is used instead of the built-in one
 ```
 - Ubuntu **24.04** ships Verilator 5, which works. Ubuntu **22.04** ships Verilator 4, which is **too old** for SV Studio.
@@ -190,8 +190,10 @@ folders for the source and build details. The builds are reproducible from
 
 The **Board** tab runs a design live on a virtual version of the Spartan-7 lab board. It works with
 any module that instantiates the lab's `BoardV3` wrapper (`Display_Decoder_Board`, `Traffic_Light_Board`,
-`MU0_Board` …). Pick it under **Board design** and press **Start board**. It needs Verilator (on
-Windows, Verilator inside WSL). The first build takes about a minute.
+`MU0_Board` …). Pick it under **Board design** and press **Start board**. Nothing needs installing:
+**Engine → Auto** uses Verilator 5 if it's installed (about 50x faster, but the first build takes a
+minute), and otherwise SV Studio's built-in Icarus Verilog. Icarus starts in about a second and is fine for the
+displays, switches and 1 Hz traffic lights, but MU0 tops out at a few thousand instructions per second.
 
 - **Inputs:** the 4×4 keypad (`button[15:0]`, laid out 1 2 3 F / 4 5 6 E / 7 8 9 D / A 0 B C, or type
   0–9/A–F), switches A–H (`button[23:16]`, A = bit 23) and the four `Simple_buttons`. Shift-click
@@ -202,11 +204,12 @@ Windows, Verilator inside WSL). The first build takes about a minute.
   Reset / Step / Run / Stop with a selectable clock speed, a live memory view with disassembly (click a
   word to change it), the memory-mapped I/O registers, and loading of any `.mem` file in the project.
 - **Timing:** `Clk_1Hz` and `Clk_1kHz` follow real time. `Clk` (100 MHz on the real board) runs as fast
-  as your PC can simulate it, usually 10–20 MHz, and the bar shows the speed.
+  as your PC can simulate it, roughly 10–20 MHz with Verilator or ~0.5 MHz with Icarus, and the bar shows the speed.
 
 SV Studio does this by compiling your design with `board/BoardV3_virtual.sv` instead of
 `BoardLib/BoardV3.v`. The model has the same ports, but talks to the UI instead of scanning the real
-keypad and displays. Your files aren't changed. The simulation is functional (no FPGA timing), and the
+keypad and displays: through DPI and a small C++ harness with Verilator, or through a VPI module
+(`tools/board-vpi/`, built by `.github/workflows/build-board-vpi.yml`) with Icarus. Your files aren't changed. The simulation is functional (no FPGA timing), and the
 UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colours for
 `Crossing_A`, and which end Digit0 sits at, are assumptions; each lamp is labelled with its bit.
 

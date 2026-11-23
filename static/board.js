@@ -113,6 +113,8 @@ function renderBoardTops() {
   sel.value = tops.includes(saved) ? saved : tops.includes(cur) ? cur : (tops[0] || "");
   $("#bdStart").disabled = !tops.length;
 }
+$("#selBoardEngine").value = LS.get("boardEngine", "auto");
+$("#selBoardEngine").onchange = (e) => LS.set("boardEngine", e.target.value);
 $("#selBoardTop").onchange = (e) => S.project && LS.set("boardtop." + S.project.root, e.target.value);
 
 async function startBoard() {
@@ -121,7 +123,7 @@ async function startBoard() {
   if (!top) { toast("This project has no module that uses the lab board (BoardV3).", "err"); return; }
   await saveAll();
   try {
-    const r = await api("/api/board/start", { top });
+    const r = await api("/api/board/start", { top, engine: $("#selBoardEngine").value });
     S.project = r.project; renderProject();
     $("#console").innerHTML = ""; S.errors = S.warnings = 0;
     S.diags = new Map(); applyDiagnostics(); renderProblems();
@@ -186,7 +188,7 @@ function renderState(st) {
   const pct = st.mhz / 100 * 100;
   $("#bdStatus").className = "job-chip " + (st.paused ? "" : "running");
   $("#bdStatus").textContent = st.paused ? "Paused" :
-    `Live · Clk ${st.mhz.toFixed(1)} MHz (${pct >= 10 ? pct.toFixed(0) : pct.toFixed(1)}% of real speed)`;
+    `Live${BD.info && BD.info.engine ? " · " + (BD.info.engine === "icarus" ? "Icarus" : "Verilator") : ""} · Clk ${st.mhz >= 1 ? st.mhz.toFixed(1) + " MHz" : (st.mhz * 1000).toFixed(0) + " kHz"} (${pct >= 10 ? pct.toFixed(0) : pct.toFixed(1)}% of real speed)`;
   $("#bdStatus").title = "Clk is 100 MHz on the real board. Clk_1Hz and Clk_1kHz always run in real time.";
 
   // displays

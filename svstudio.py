@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "vsim_flags": "",
     "verilator_flags": "",
     "iverilog_flags": "",
+    "board_engine": "auto",      # virtual board: "auto" (Verilator if usable, else built-in Icarus), "verilator", "icarus"
     "use_bundled_icarus": True,
     "auto_update": "auto",      # "auto" (install updates when SV Studio starts), "notify" or "off"  # Windows: use the Icarus Verilog that ships with SV Studio
     "vivado_path": "",          # vivado / vivado.bat (auto-detected if empty)
@@ -1078,16 +1079,7 @@ _VL_VER = {}
 
 def verilator_too_old(job, pre, root):
     """Verilator 4 (e.g. Ubuntu 22.04's package) lacks --timing/--binary; explain how to get 5."""
-    key = " ".join(pre)
-    if key not in _VL_VER:
-        try:
-            r = subprocess.run(pre + ["--version"], capture_output=True, text=True, timeout=60, cwd=root,
-                               creationflags=0x08000000 if IS_WIN else 0)
-            m = re.search(r"Verilator (\d+)\.(\d+)", r.stdout)
-            _VL_VER[key] = (int(m.group(1)), int(m.group(2))) if m else None
-        except Exception:
-            _VL_VER[key] = None
-    v = _VL_VER[key]
+    v = _verilator_version(pre, root)
     if v and v[0] < 5:
         job.log(f"Verilator {v[0]}.{v[1]:03d} is too old - SV Studio needs Verilator 5 or newer.", "err")
         job.log("Ubuntu 22.04's package is version 4. Get Verilator 5 from the OSS CAD Suite:", "err")
@@ -1248,24 +1240,39 @@ def _board_wrapper(proj, top):
             "\n  );\nendmodule\n")
 
 
-def board_build(job, proj, top):
-    """Build the live board simulation. Returns argv to run it (cwd = project root) or None."""
+BOARD_VPI_DIR = APP_DIR / "tools" / "board-vpi" / ("win" if IS_WIN else "linux")
+
+
+def _verilator_version(pre, root):
+    key = " ".join(pre)
+    if key not in _VL_VER:
+        try:
+            r = subprocess.run(pre + ["--version"], capture_output=True, text=True, timeout=60, cwd=root,
+                               creationflags=0x08000000 if IS_WIN else 0)
+            m = re.search(r"Verilator (\d+)\.(\d+)", r.stdout)
+            _VL_VER[key] = (int(m.group(1)), int(m.group(2))) if m else None
+        except Exception:
+            _VL_VER[key] = None
+    return _VL_VER[key]
+
+
+def board_engine(proj, choice="auto"):
+    """Which simulator runs the virtual board. Verilator is ~50x faster but needs Verilator 5 plus
+    make/g++; Icarus (built into SV Studio) needs nothing installed."""
+    if choice in ("verilator", "icarus"):
+        return choice
+    root = proj["root"]
+    pre, conv, via_wsl = _tool("verilator", root)
+    if pre:
+        v = _verilator_version(pre, root)
+        tools_ok = wsl_tool("make") if via_wsl else (IS_WIN or all(shutil.which(t) for t in ("make", "g++")))
+        if v and v[0] >= 5 and tools_ok:
+            return "verilator"
+    return "icarus"
+
+
+def _board_sources(job, proj, top, conv):
     root = Path(proj["root"])
-    if not any(m["name"] == top for m in proj["modules"]):
-        job.log(f"Module '{top}' not found.", "err")
-        return None
-    if top not in board_tops(proj):
-        job.log(f"'{top}' doesn't instantiate the lab board ({BOARD_MODULE}). Pick a *_Board module.", "err")
-        return None
-    pre, conv, via_wsl = _tool("verilator", str(root))
-    if not pre:
-        _wsl_missing(job, ["Verilator (the virtual board needs it)"], "verilator build-essential")
-        return None
-    if via_wsl and not wsl_tool("make"):
-        _wsl_missing(job, ["make / g++ (needed to build the virtual board)"], "build-essential")
-        return None
-    if _native_build_tools_missing(job, via_wsl) or verilator_too_old(job, pre, str(root)):
-        return None
     need, mods = _board_closure(proj, top)
     defining = {}
     for m in proj["modules"]:
@@ -1288,12 +1295,42 @@ def board_build(job, proj, top):
         files.insert(0, conv(f"{BUILD_DIR}/{PRIMS_FILE}"))
         job.log("Using SV Studio's built-in models for Xilinx primitives: " + ", ".join(used[:12]), "info")
     shutil.copyfile(BOARD_DIR / "BoardV3_virtual.sv", build / "BoardV3_virtual.sv")
+    files.append(conv(f"{BUILD_DIR}/BoardV3_virtual.sv"))
+    return files, build
+
+
+def board_build(job, proj, top, engine="auto"):
+    """Build the live board simulation. Returns argv to run it (cwd = run_dir(proj)) or None."""
+    root = Path(proj["root"])
+    if not any(m["name"] == top for m in proj["modules"]):
+        job.log(f"Module '{top}' not found.", "err")
+        return None
+    if top not in board_tops(proj):
+        job.log(f"'{top}' doesn't instantiate the lab board ({BOARD_MODULE}). Pick a *_Board module.", "err")
+        return None
+    eng = board_engine(proj, engine)
+    if eng == "icarus":
+        if engine == "auto":
+            job.log("Running the board on SV Studio's built-in Icarus Verilog (no installs needed). "
+                    "Install Verilator 5 for a ~50x faster board.", "info")
+        return board_build_icarus(job, proj, top)
+    pre, conv, via_wsl = _tool("verilator", str(root))
+    if not pre:
+        _wsl_missing(job, ["Verilator"], "verilator build-essential")
+        return None
+    if via_wsl and not wsl_tool("make"):
+        _wsl_missing(job, ["make / g++ (needed to build the virtual board)"], "build-essential")
+        return None
+    if _native_build_tools_missing(job, via_wsl) or verilator_too_old(job, pre, str(root)):
+        return None
+    files, build = _board_sources(job, proj, top, conv)
     (build / "svs_board_top.sv").write_text(_board_wrapper(proj, top), encoding="utf-8")
-    files += [conv(f"{BUILD_DIR}/BoardV3_virtual.sv"), conv(f"{BUILD_DIR}/svs_board_top.sv")]
+    files.append(conv(f"{BUILD_DIR}/svs_board_top.sv"))
     mdir = verilator_mdir(str(root), via_wsl)
     mdir = mdir.rstrip("/\\") + "_board" if not mdir.endswith("obj_dir") else str(Path(mdir).parent / "obj_board")
     if not via_wsl:
         Path(mdir).mkdir(parents=True, exist_ok=True)
+    write_build_file(f"{mdir}/board_core.h", (BOARD_DIR / "board_core.h").read_text(encoding="utf-8"), via_wsl)
     main_cpp = write_build_file(f"{mdir}/board_main.cpp",
                                 (BOARD_DIR / "board_main.cpp").read_text(encoding="utf-8"), via_wsl)
     incs = ["-I" + conv(_rel(d, str(root))) for d in _incdirs(proj)]
@@ -1337,6 +1374,42 @@ def run_dir(proj):
         if all((d / p).exists() for p in rel):
             return str(d)
     return str(root)
+
+
+def _board_wrapper_icarus(proj, top):
+    """Like _board_wrapper, but the 100 MHz clock is generated here (Icarus runs on simulated time)."""
+    w = _board_wrapper(proj, top)
+    return w.replace(f"module {BOARD_TOP} (input logic Clk);",
+                     f"module {BOARD_TOP};\n  logic Clk = 1'b0;\n  always #5 Clk = ~Clk;   // 100 MHz")
+
+
+def board_build_icarus(job, proj, top):
+    root = Path(proj["root"])
+    vpi = BOARD_VPI_DIR / "svs_board.vpi"
+    if not vpi.exists():
+        job.log(f"The board's Icarus module is missing ({_rel(str(vpi), str(APP_DIR))}). "
+                "Update SV Studio, or install Verilator.", "err")
+        return None
+    pre, _, _ = _tool("iverilog", str(root))
+    vpre, _, _ = _tool("vvp", str(root))
+    if not pre or not vpre:
+        job.log("Icarus Verilog not found (the built-in copy may be switched off in Settings).", "err")
+        return None
+    files, build = _board_sources(job, proj, top, lambda x: x)
+    (build / "svs_board_top.sv").write_text(_board_wrapper_icarus(proj, top), encoding="utf-8")
+    files.append(f"{BUILD_DIR}/svs_board_top.sv")
+    incs = ["-I" + _rel(d, str(root)) for d in _incdirs(proj)]
+    out = f"{BUILD_DIR}/board.vvp"
+    job.log(f"Building the virtual lab board for '{top}' with Icarus Verilog ({len(files)} files)…", "info")
+    cmd = pre + _bundled_icarus_args(pre, "iverilog") + ["-g2012", "-o", out, "-s", BOARD_TOP] + incs + \
+        _split(CONFIG.get("iverilog_flags")) + files
+    if run_cmd(job, cmd, str(root)) != 0:
+        return None
+    rd = run_dir(proj)
+    if rd != str(root):
+        job.log(f"Running from {rd} so the design's memory files ($readmemh) are found.", "info")
+    return vpre + _bundled_icarus_args(vpre, "vvp") + ["-M", str(vpi.parent), "-m", "svs_board", "-n",
+                                                       str((root / out).resolve())]
 
 
 class BoardSession:
@@ -1417,15 +1490,17 @@ class BoardSession:
 BOARD = {"session": None}
 
 
-def board_worker(job, proj, top):
+def board_worker(job, proj, top, engine="auto"):
     try:
         job.log(f"{APP_NAME} · virtual lab board · project: {proj['name']}", "info")
         if BOARD["session"]:
             BOARD["session"].stop()
             BOARD["session"] = None
-        argv = board_build(job, proj, top)
+        argv = board_build(job, proj, top, engine)
         if argv and not job.cancelled:
-            sess = BoardSession(proj, top, board_info(proj, top))
+            info = board_info(proj, top)
+            info["engine"] = board_engine(proj, engine)
+            sess = BoardSession(proj, top, info)
             sess.start(argv)
             BOARD["session"] = sess
             job.log("Board is live - switch to the Board tab.", "info")
@@ -2330,7 +2405,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "Pick a module that uses the lab board (e.g. Display_Decoder_Board)."})
                 job = Job("board")
                 JOBS[job.id] = job
-                threading.Thread(target=board_worker, daemon=True, args=(job, proj, top)).start()
+                engine = b.get("engine") or CONFIG.get("board_engine", "auto")
+                threading.Thread(target=board_worker, daemon=True, args=(job, proj, top, engine)).start()
                 return self._send(200, {"id": job.id, "project": proj})
             if u.path == "/api/update/apply":
                 if any(not j.done for j in JOBS.values()):

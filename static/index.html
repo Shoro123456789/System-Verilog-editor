@@ -147,6 +147,8 @@
     <section class="tab" id="tab-board">
       <div class="board-bar">
         <label class="field"><span>Board design</span><select id="selBoardTop"><option value="">—</option></select></label>
+        <label class="field" title="Verilator runs the board about 50x faster but must be installed (Verilator 5 + make/g++). Icarus is built into SV Studio."><span>Engine</span><select id="selBoardEngine">
+          <option value="auto">Auto</option><option value="icarus">Icarus (built in)</option><option value="verilator">Verilator (fast)</option></select></label>
         <button class="btn primary sm" id="bdStart" title="Build the design with the virtual lab board and run it live">
           <svg viewBox="0 0 24 24"><path class="fill" d="M7 4l13 8-13 8z"/></svg><span>Start board</span></button>
         <button class="btn sm" id="bdPause" disabled>Pause</button>
@@ -159,7 +161,7 @@
         <div class="board-empty" id="boardEmpty">
           <h3>Virtual COMP12111 lab board</h3>
           <p>Pick a module that uses the lab board wrapper (<code>Display_Decoder_Board</code>, <code>Traffic_Light_Board</code>, <code>MU0_Board</code>…) and press <b>Start board</b>.</p>
-          <p class="muted small">SV Studio swaps the lab's <code>BoardV3</code> for a model with the same ports and runs your design live with Verilator. Press keys and flip switches here and watch the displays and lights. <code>Clk_1Hz</code> and <code>Clk_1kHz</code> follow real time, and <code>Clk</code> runs as fast as your PC can simulate it.</p>
+          <p class="muted small">SV Studio swaps the lab's <code>BoardV3</code> for a model with the same ports and runs your design live: on the built-in Icarus Verilog (nothing to install), or on Verilator if it's installed, which is about 50x faster. Press keys and flip switches here and watch the displays and lights. <code>Clk_1Hz</code> and <code>Clk_1kHz</code> follow real time, and <code>Clk</code> runs as fast as your PC can simulate it.</p>
         </div>
         <div class="board-wrap" id="boardWrap" hidden>
           <div class="pcb">

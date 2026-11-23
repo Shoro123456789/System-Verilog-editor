@@ -1,0 +1,97 @@
+name: build-board-vpi
+# Builds svs_board.vpi, the Icarus Verilog module behind the virtual lab board, for Linux x86-64
+# (on Ubuntu 22.04, so it runs on 22.04+) and Windows x64 (MinGW-w64), tests both with SV Studio's
+# bundled Icarus, and commits them to tools/board-vpi/.
+on:
+  push:
+    branches: [main]
+    paths: ["board/board_core.h", "board/board_vpi.cpp", "board/vpi_include/**", ".github/workflows/build-board-vpi.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix
+          mkdir -p tools/board-vpi/linux tools/board-vpi/win
+          g++ -O2 -std=c++17 -shared -fPIC -Iboard/vpi_include board/board_vpi.cpp -o tools/board-vpi/linux/svs_board.vpi \
+              -pthread -static-libstdc++ -static-libgcc
+          strip tools/board-vpi/linux/svs_board.vpi
+          x86_64-w64-mingw32-gcc-posix -O2 -c -Iboard/vpi_include board/vpi_include/libvpi.c -o /tmp/libvpi.o
+          x86_64-w64-mingw32-g++-posix -O2 -std=c++17 -shared -Iboard/vpi_include board/board_vpi.cpp /tmp/libvpi.o \
+              -o tools/board-vpi/win/svs_board.vpi -static -static-libgcc -static-libstdc++
+          x86_64-w64-mingw32-strip tools/board-vpi/win/svs_board.vpi
+          ls -la tools/board-vpi/*
+      - name: Write test design
+        run: |
+          mkdir -p /tmp/bt
+          cat > /tmp/bt/top.sv <<'SV'
+          `timescale 1ns/1ps
+          module svs_board_top;
+            logic Clk = 1'b0;
+            always #5 Clk = ~Clk;
+            wire [23:0] button;
+            BoardV3 b (.Clk(Clk), .button(button), .Digit0(button[14:0]), .Digit1(15'd0), .Digit2(15'd0),
+                       .Digit3(15'd0), .Digit4(15'd0), .Digit5(15'd0), .Crossing_A(5'd0), .Crossing_B(6'd0),
+                       .S7_leds(2'd0), .Buzzer(1'b0), .dac_we(1'b0), .dac_data(12'd0), .proc_fetch(1'b0),
+                       .proc_halted(1'b0), .proc_din(16'd0), .proc_cc(4'd0), .mem_din(16'd0),
+                       .bp_detected(1'b0), .bp_mem_data_read(1'b0));
+          endmodule
+          SV
+          cp board/BoardV3_virtual.sv /tmp/bt/
+          cp -r board/BoardV3_virtual.sv tools/board-vpi /tmp/bt/ 2>/dev/null || true
+      - name: Test (Linux)
+        run: |
+          I=$PWD/tools/iverilog-linux
+          $I/bin/iverilog -B $I/lib/ivl -g2012 -o /tmp/bt/t.vvp -s svs_board_top /tmp/bt/BoardV3_virtual.sv /tmp/bt/top.sv
+          (sleep 1; echo "b 7"; sleep 2; echo quit) | $I/bin/vvp -M $I/lib/ivl -M $PWD/tools/board-vpi/linux -m svs_board -n /tmp/bt/t.vvp > /tmp/bt/out.txt
+          grep -m1 "running" /tmp/bt/out.txt
+          grep -q '"d":\[7,' /tmp/bt/out.txt && echo "Linux board VPI OK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: board
+          path: |
+            tools/board-vpi
+            /tmp/bt
+  test-windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: board, path: art }
+      - name: Test (Windows)
+        shell: bash
+        run: |
+          find art -maxdepth 4 | head -20
+          VPI=$(dirname "$(find art -path '*win/svs_board.vpi' | head -1)")
+          TOP=$(find art -name top.sv | head -1)
+          I=$PWD/tools/iverilog-win
+          $I/bin/iverilog.exe -B $I/lib/ivl -g2012 -o t.vvp -s svs_board_top board/BoardV3_virtual.sv "$TOP"
+          (sleep 2; echo "b 7"; sleep 3; echo quit) | $I/bin/vvp.exe -M $I/lib/ivl -M "$VPI" -m svs_board -n t.vvp > out.txt
+          head -c 400 out.txt; echo
+          grep -q '"d":\[7,' out.txt && echo "Windows board VPI OK"
+  commit:
+    needs: [build, test-windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: board, path: art }
+      - name: Commit
+        run: |
+          rm -rf tools/board-vpi && mkdir -p tools/board-vpi
+          cp -r "$(dirname "$(find art -path '*linux/svs_board.vpi' | head -1)")" tools/board-vpi/linux
+          cp -r "$(dirname "$(find art -path '*win/svs_board.vpi' | head -1)")" tools/board-vpi/win
+          chmod +x tools/board-vpi/linux/svs_board.vpi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A tools/board-vpi
+          git diff --cached --quiet && exit 0
+          git commit -m "Build virtual-board VPI module (Linux + Windows) [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
