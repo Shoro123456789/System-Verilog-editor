@@ -247,16 +247,48 @@ void vl_stop(const char* filename, int linenum, const char* hier) VL_MT_UNSAFE {
 """
 
 
-def write_stop_handler(mdir, via_wsl):
-    """Put svs_stop.cpp inside the Verilator build dir (make runs there, so paths stay space-free)."""
-    path = f"{mdir}/svs_stop.cpp"
+def write_build_file(path, text, via_wsl):
+    """Write a file into a Verilator build dir (which may live inside WSL)."""
     if via_wsl:
         subprocess.run([shutil.which("wsl") or "wsl.exe", "-e", "sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", path],
-                       input=VL_STOP_CPP.encode(), capture_output=True, timeout=60,
+                       input=text.encode(), capture_output=True, timeout=60,
                        creationflags=0x08000000 if IS_WIN else 0)
     else:
-        Path(path).write_text(VL_STOP_CPP, encoding="utf-8")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text, encoding="utf-8")
     return path
+
+
+def clean_dep_files(mdir, via_wsl):
+    """Remove Verilator's *__ver.d. It lists sources relative to the project, but make runs inside the
+    build dir, so a second build in the same dir would fail with 'No rule to make target'."""
+    try:
+        if via_wsl:
+            subprocess.run([shutil.which("wsl") or "wsl.exe", "-e", "sh", "-c", 'rm -f "$1"/*__ver.d', "sh", mdir],
+                           capture_output=True, timeout=60, creationflags=0x08000000 if IS_WIN else 0)
+        else:
+            for f in glob.glob(os.path.join(mdir, "*__ver.d")):
+                os.remove(f)
+    except Exception:
+        pass
+
+
+def verilate_and_make(job, cmd, mdir, prefix, root, via_wsl):
+    """Run Verilator (without --build), drop its *__ver.d, then run make in the build dir."""
+    if run_cmd(job, cmd, root) != 0:
+        return False
+    clean_dep_files(mdir, via_wsl)
+    jobs = str(max(2, min(16, os.cpu_count() or 2)))
+    if via_wsl:
+        mk = [shutil.which("wsl") or "wsl.exe", "-e", "make", "-C", mdir, "-f", f"{prefix}.mk", "-j", jobs]
+    else:
+        mk = [shutil.which("make") or "make", "-C", mdir, "-f", f"{prefix}.mk", "-j", jobs]
+    return run_cmd(job, mk, root) == 0
+
+
+def write_stop_handler(mdir, via_wsl):
+    """Put svs_stop.cpp inside the Verilator build dir (make runs there, so paths stay space-free)."""
+    return write_build_file(f"{mdir}/svs_stop.cpp", VL_STOP_CPP, via_wsl)
 
 
 def to_wsl_path(p):
@@ -590,6 +622,7 @@ def load_project(path):
         "dumpfile": dumpfile,
         "defines": collect_defines(files),
     }
+    proj["board_tops"] = board_tops(proj)
     recent = [r for r in CONFIG.get("recent", []) if r != str(mpf or root)]
     CONFIG["recent"] = [str(mpf or root)] + recent[:9]
     save_config(CONFIG)
@@ -914,10 +947,10 @@ def verilator_build(job, proj, top, runtime, lint_only=False):
     mdir = verilator_mdir(str(root), via_wsl)
     job.verilator_mdir = mdir
     stop_cpp = write_stop_handler(mdir, via_wsl)
-    cmd = base + ["--binary", "--trace", "-j", "0", "--top-module", WRAPPER_TOP,
+    cmd = base + ["--main", "--exe", "--trace", "--top-module", WRAPPER_TOP,
                   "-Mdir", mdir, "-o", "Vsim", "-CFLAGS", "-DVL_USER_STOP"] + \
         files + [conv(_rel(str(wp), str(root))), stop_cpp]
-    ok = run_cmd(job, cmd, str(root)) == 0
+    ok = verilate_and_make(job, cmd, mdir, "V" + WRAPPER_TOP, str(root), via_wsl)
     return ok, vcd_rel, via_wsl
 
 
@@ -970,6 +1003,236 @@ def icarus_sim(job, proj, top, runtime):
     pre, _, _ = _tool("vvp", str(root))
     rc = run_cmd(job, (pre or ["vvp"]) + ["-n", f"{BUILD_DIR}/sim.vvp"], str(root))
     return rc, root / vcd_rel
+
+
+# --------------------------------------------------------------------------- virtual lab board
+# Live simulation of designs built on the COMP12111 lab board wrapper (BoardV3). The lab's
+# BoardV3 is swapped for board/BoardV3_virtual.sv, which exchanges keypad/switch/display/LED
+# state and the Ackie (Bennett) MU0 port with the UI through a small C++ harness.
+BOARD_DIR = APP_DIR / "board"
+BOARD_MODULE = "BoardV3"
+BOARD_TOP = "svs_board_top"
+
+
+def board_tops(proj):
+    """Modules that instantiate the lab board wrapper directly (e.g. Display_Decoder_Board)."""
+    return [m["name"] for m in proj["modules"] if BOARD_MODULE in m["deps"]]
+
+
+def _board_closure(proj, top):
+    mods = {m["name"]: m for m in proj["modules"]}
+    seen, stack = set(), [top]
+    while stack:
+        n = stack.pop()
+        if n in seen or n not in mods or n == BOARD_MODULE:
+            continue
+        seen.add(n)
+        stack.extend(mods[n]["deps"])
+    return seen, mods
+
+
+def board_info(proj, top):
+    need, mods = _board_closure(proj, top)
+    return {"top": top, "mu0": any(n == "MU0" or n.startswith("MU0_Memory") for n in need)}
+
+
+def _board_wrapper(proj, top):
+    mod = next(m for m in proj["modules"] if m["name"] == top)
+    conns = []
+    for p in mod["ports"]:
+        n, d = p["name"], p["dir"]
+        if d == "input":
+            if n.lower() in ("clk", "clock"):
+                conns.append(f".{n}(Clk)")
+            elif "keycol" in n.lower():
+                conns.append(f".{n}('1)")      # no key pressed (active-low columns)
+            else:
+                conns.append(f".{n}('0)")
+        else:
+            conns.append(f".{n}()")
+    return ("// Generated by SV Studio for the virtual lab board\n`timescale 1ns/1ps\n"
+            f"module {BOARD_TOP} (input logic Clk);\n  {top} dut (\n    " + ",\n    ".join(conns) +
+            "\n  );\nendmodule\n")
+
+
+def board_build(job, proj, top):
+    """Build the live board simulation. Returns argv to run it (cwd = project root) or None."""
+    root = Path(proj["root"])
+    if not any(m["name"] == top for m in proj["modules"]):
+        job.log(f"Module '{top}' not found.", "err")
+        return None
+    if top not in board_tops(proj):
+        job.log(f"'{top}' doesn't instantiate the lab board ({BOARD_MODULE}). Pick a *_Board module.", "err")
+        return None
+    pre, conv, via_wsl = _tool("verilator", str(root))
+    if not pre:
+        _wsl_missing(job, ["Verilator (the virtual board needs it)"], "verilator build-essential")
+        return None
+    if via_wsl and not wsl_tool("make"):
+        _wsl_missing(job, ["make / g++ (needed to build the virtual board)"], "build-essential")
+        return None
+    need, mods = _board_closure(proj, top)
+    defining = {}
+    for m in proj["modules"]:
+        defining.setdefault(m["file"], set()).add(m["name"])
+    files = []
+    for f in proj["files"]:
+        if f["kind"] not in ("sv", "v") or not f["exists"]:
+            continue
+        names = defining.get(f["path"])
+        if names is None or names & need:
+            if names and BOARD_MODULE in names:
+                continue
+            files.append(conv(_rel(f["path"], str(root))))
+    build = root / BUILD_DIR
+    build.mkdir(exist_ok=True)
+    used = sorted({p for n in need for p in mods[n]["prims"]})
+    if used:
+        (build / PRIMS_FILE).write_text("`timescale 1ns/1ps\n\n" + "\n".join(PRIMS[n] for n in sorted(PRIMS)),
+                                        encoding="utf-8")
+        files.insert(0, conv(f"{BUILD_DIR}/{PRIMS_FILE}"))
+        job.log("Using SV Studio's built-in models for Xilinx primitives: " + ", ".join(used[:12]), "info")
+    shutil.copyfile(BOARD_DIR / "BoardV3_virtual.sv", build / "BoardV3_virtual.sv")
+    (build / "svs_board_top.sv").write_text(_board_wrapper(proj, top), encoding="utf-8")
+    files += [conv(f"{BUILD_DIR}/BoardV3_virtual.sv"), conv(f"{BUILD_DIR}/svs_board_top.sv")]
+    mdir = verilator_mdir(str(root), via_wsl)
+    mdir = mdir.rstrip("/\\") + "_board" if not mdir.endswith("obj_dir") else str(Path(mdir).parent / "obj_board")
+    if not via_wsl:
+        Path(mdir).mkdir(parents=True, exist_ok=True)
+    main_cpp = write_build_file(f"{mdir}/board_main.cpp",
+                                (BOARD_DIR / "board_main.cpp").read_text(encoding="utf-8"), via_wsl)
+    incs = ["-I" + conv(_rel(d, str(root))) for d in _incdirs(proj)]
+    job.log(f"Building the virtual lab board for '{top}' ({len(files)} files, lab {BOARD_MODULE} replaced by SV Studio's model)…", "info")
+    if via_wsl:
+        job.log("Running Verilator inside WSL - the first build takes a minute.", "info")
+    cmd = pre + ["--cc", "--exe", "--no-timing", "--timescale", "1ns/1ps",
+                 "-Wno-fatal", "-Wno-lint", "-Wno-style", "-Wno-MULTITOP", "-Wno-TIMESCALEMOD",
+                 "-Wno-STMTDLY", "-Wno-PINCONNECTEMPTY", "-O3", "-CFLAGS", "-O2", "-LDFLAGS", "-pthread",
+                 "--top-module", BOARD_TOP, "-Mdir", mdir, "-o", "Vboard"] + incs + files + [main_cpp]
+    if not verilate_and_make(job, cmd, mdir, "V" + BOARD_TOP, str(root), via_wsl):
+        return None
+    if via_wsl:
+        return [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(str(root)), "-e", f"{mdir}/Vboard"]
+    exe = Path(mdir) / ("Vboard.exe" if IS_WIN else "Vboard")
+    return [str(exe)]
+
+
+class BoardSession:
+    def __init__(self, proj, top, info):
+        self.proj, self.top, self.info = proj, top, info
+        self.proc = None
+        self.state = None
+        self.seq = 0
+        self.lines = []
+        self.lock = threading.Lock()
+        self.alive = False
+        self.exit_code = None
+
+    def start(self, argv):
+        kw = {"creationflags": 0x08000000} if IS_WIN else {"start_new_session": True}
+        self.proc = subprocess.Popen(argv, cwd=self.proj["root"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                     bufsize=1, env=_env(), **kw)
+        self.alive = True
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        for line in self.proc.stdout:
+            line = line.rstrip("\r\n")
+            if line.startswith("@S "):
+                try:
+                    st = json.loads(line[3:])
+                except ValueError:
+                    continue
+                with self.lock:
+                    self.state = st
+                    self.seq += 1
+            else:
+                with self.lock:
+                    self.lines.append(line)
+                    del self.lines[:-500]
+        self.exit_code = self.proc.wait()
+        self.alive = False
+
+    def send(self, cmd):
+        if not self.alive or not self.proc or not self.proc.stdin:
+            raise ValueError("The virtual board isn't running")
+        try:
+            self.proc.stdin.write(cmd.strip() + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            raise ValueError("The virtual board isn't running")
+
+    def snapshot(self, since):
+        with self.lock:
+            return {"alive": self.alive, "top": self.top, "info": self.info, "state": self.state, "seq": self.seq,
+                    "log": self.lines[since:] if since <= len(self.lines) else self.lines[-50:],
+                    "next": len(self.lines), "exit": self.exit_code}
+
+    def stop(self):
+        p = self.proc
+        if not p:
+            return
+        try:
+            if self.alive:
+                p.stdin.write("quit\n")
+                p.stdin.flush()
+                p.wait(timeout=2)
+        except Exception:
+            pass
+        if p.poll() is None:
+            try:
+                if IS_WIN:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                else:
+                    os.killpg(p.pid, signal.SIGTERM)
+            except Exception:
+                p.kill()
+        self.alive = False
+
+
+BOARD = {"session": None}
+
+
+def board_worker(job, proj, top):
+    try:
+        job.log(f"{APP_NAME} · virtual lab board · project: {proj['name']}", "info")
+        if BOARD["session"]:
+            BOARD["session"].stop()
+            BOARD["session"] = None
+        argv = board_build(job, proj, top)
+        if argv and not job.cancelled:
+            sess = BoardSession(proj, top, board_info(proj, top))
+            sess.start(argv)
+            BOARD["session"] = sess
+            job.log("Board is live - switch to the Board tab.", "info")
+            job.ok = True
+        else:
+            job.ok = False
+    except Exception as e:
+        job.log(f"Error: {e}", "err")
+        job.ok = False
+    finally:
+        el = time.time() - job.started
+        job.log(("✔ Board started" if job.ok else "✖ Board build failed") + f" in {el:.1f}s",
+                "done-ok" if job.ok else "done-err")
+        job.done = True
+
+
+def parse_memfile(path):
+    """$readmemh-style file -> list of (addr, value)."""
+    out, addr = [], 0
+    text = _strip_comments(Path(path).read_text(encoding="utf-8", errors="replace"))
+    for tok in text.split():
+        if tok.startswith("@"):
+            addr = int(tok[1:], 16)
+            continue
+        tok = tok.replace("_", "")
+        if re.fullmatch(r"[0-9a-fA-F]+", tok):
+            out.append((addr & 0xFFF, int(tok, 16) & 0xFFFF))
+            addr += 1
+    return out
 
 
 ERR_RE = re.compile(r"(\*\* Error|%Error|\berror\b|Fatal)", re.I)
@@ -1135,6 +1398,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not job:
                     return self._send(404, {"error": "no such job"})
                 return self._send(200, job.snapshot(int(q.get("since", 0))))
+            if u.path == "/api/board/memfiles":
+                proj = STATE["project"]
+                files = []
+                if proj:
+                    for dp, dn, fn in os.walk(proj["root"]):
+                        dn[:] = sorted(d for d in dn if d not in SKIP_DIRS and not d.startswith("."))
+                        for f in sorted(fn):
+                            if f.lower().endswith(".mem"):
+                                full = str(Path(dp, f))
+                                files.append({"path": full, "rel": _rel(full, proj["root"])})
+                        if len(files) > 50:
+                            break
+                return self._send(200, {"files": files})
+            if u.path == "/api/board/state":
+                sess = BOARD["session"]
+                if not sess:
+                    return self._send(200, {"alive": False, "state": None})
+                return self._send(200, sess.snapshot(int(q.get("since", 0))))
             if u.path == "/api/file":
                 proj = STATE["project"]
                 path = q.get("path", "")
@@ -1178,6 +1459,46 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=job_worker, daemon=True, args=(
                     job, job.kind, proj, b.get("backend", "questa"), b.get("top"), b.get("runtime", "-all"))).start()
                 return self._send(200, {"id": job.id, "project": proj})
+            if u.path == "/api/board/start":
+                proj = STATE["project"]
+                if not proj:
+                    return self._send(400, {"error": "Open a project first"})
+                proj = STATE["project"] = load_project(proj["mpf"] or proj["root"])
+                if any(not j.done for j in JOBS.values()):
+                    return self._send(409, {"error": "A job is already running"})
+                top = b.get("top") or ""
+                if top not in board_tops(proj):
+                    return self._send(400, {"error": "Pick a module that uses the lab board (e.g. Display_Decoder_Board)."})
+                job = Job("board")
+                JOBS[job.id] = job
+                threading.Thread(target=board_worker, daemon=True, args=(job, proj, top)).start()
+                return self._send(200, {"id": job.id, "project": proj})
+            if u.path == "/api/board/cmd":
+                sess = BOARD["session"]
+                if not sess:
+                    return self._send(400, {"error": "The virtual board isn't running"})
+                for c in (b.get("cmds") or [b.get("cmd", "")]):
+                    if c:
+                        sess.send(str(c)[:200])
+                return self._send(200, {"ok": True})
+            if u.path == "/api/board/loadmem":
+                sess, proj = BOARD["session"], STATE["project"]
+                if not sess or not proj:
+                    return self._send(400, {"error": "The virtual board isn't running"})
+                path = b.get("path", "")
+                if not _allowed(path, proj["root"]):
+                    return self._send(403, {"error": "File is outside the project folder"})
+                words = parse_memfile(path)
+                sess.send("stop")
+                for a, v in words:
+                    sess.send(f"w {a:x} {v:x}")
+                sess.send("reset")
+                return self._send(200, {"ok": True, "words": len(words)})
+            if u.path == "/api/board/stop":
+                if BOARD["session"]:
+                    BOARD["session"].stop()
+                    BOARD["session"] = None
+                return self._send(200, {"ok": True})
             if u.path == "/api/stop":
                 for j in JOBS.values():
                     if not j.done:
@@ -1312,6 +1633,8 @@ def main():
         for j in JOBS.values():
             if not j.done:
                 kill_job(j)
+        if BOARD["session"]:
+            BOARD["session"].stop()
         httpd.shutdown()
 
 

@@ -80,6 +80,30 @@ The app quits on its own a few minutes after you close its window. Optionally, `
 
 Your chosen signals and radixes are remembered and kept when you re-run the simulation.
 
+## Virtual lab board (COMP12111)
+
+The **Board** tab runs a design live on a virtual version of the Spartan-7 lab board. It works with
+any module that instantiates the lab's `BoardV3` wrapper (`Display_Decoder_Board`, `Traffic_Light_Board`,
+`MU0_Board` …). Pick it under **Board design** and press **Start board**. It needs Verilator (on
+Windows, Verilator inside WSL). The first build takes about a minute.
+
+- **Inputs:** the 4×4 keypad (`button[15:0]`, laid out 1 2 3 F / 4 5 6 E / 7 8 9 D / A 0 B C, or type
+  0–9/A–F), switches A–H (`button[23:16]`, A = bit 23) and the four `Simple_buttons`. Shift-click
+  latches a button.
+- **Outputs:** six 14-segment displays (`Digit5` … `Digit0`), the traffic lights (`Crossing_A`,
+  `Crossing_B`), the two S7 LEDs and the buzzer (tick *Buzzer sound* to hear it).
+- **MU0:** for designs containing MU0, a Bennett-style panel shows ACC, PC and the N/Z flags. It has
+  Reset / Step / Run / Stop with a selectable clock speed, a live memory view with disassembly (click a
+  word to change it), the memory-mapped I/O registers, and loading of any `.mem` file in the project.
+- **Timing:** `Clk_1Hz` and `Clk_1kHz` follow real time. `Clk` (100 MHz on the real board) runs as fast
+  as your PC can simulate it, usually 10–20 MHz, and the bar shows the speed.
+
+SV Studio does this by compiling your design with `board/BoardV3_virtual.sv` instead of
+`BoardLib/BoardV3.v`. The model has the same ports, but talks to the UI instead of scanning the real
+keypad and displays. Your files aren't changed. The simulation is functional (no FPGA timing), and the
+UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colours for
+`Crossing_A`, and which end Digit0 sits at, are assumptions; each lamp is labelled with its bit.
+
 ## Settings (⚙)
 
 - **Questa bin folder:** set this if Questa isn't auto-detected, e.g. `C:\altera_lite\25.1std\questa_fse\win64` or `C:\intelFPGA_lite\23.1std\questa_fse\win64`.

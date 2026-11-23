@@ -65,6 +65,7 @@
       <button data-tab="problems">Problems <span class="badge" id="problemsBadge" hidden></span></button>
       <button data-tab="wave">Waveform <span class="badge info" id="waveBadge" hidden></span></button>
       <button data-tab="editor">Editor <span class="badge dim" id="editorBadge" hidden></span></button>
+      <button data-tab="board">Board <span class="badge info" id="boardBadge" hidden>live</span></button>
     </nav>
 
     <section class="tab active" id="tab-console">
@@ -128,6 +129,92 @@
           <div class="wave-empty" id="waveEmpty">
             <svg viewBox="0 0 120 40" width="160"><path d="M2 30h14V10h22v20h18V10h22v20h18V10h22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/></svg>
             <p>No waveform loaded yet.<br>Press <b>Simulate</b> or open a <code>.vcd</code> file.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-board">
+      <div class="board-bar">
+        <label class="field"><span>Board design</span><select id="selBoardTop"><option value="">—</option></select></label>
+        <button class="btn primary sm" id="bdStart" title="Build the design with the virtual lab board and run it live">
+          <svg viewBox="0 0 24 24"><path class="fill" d="M7 4l13 8-13 8z"/></svg><span>Start board</span></button>
+        <button class="btn sm" id="bdPause" disabled>Pause</button>
+        <button class="btn danger sm" id="bdStop" disabled>Stop</button>
+        <span class="job-chip" id="bdStatus">Not running</span>
+        <div class="spacer"></div>
+        <label class="check" title="Play the buzzer through your speakers"><input type="checkbox" id="bdSound"> Buzzer sound</label>
+      </div>
+      <div class="board-body">
+        <div class="board-empty" id="boardEmpty">
+          <h3>Virtual COMP12111 lab board</h3>
+          <p>Pick a module that uses the lab board wrapper (<code>Display_Decoder_Board</code>, <code>Traffic_Light_Board</code>, <code>MU0_Board</code>…) and press <b>Start board</b>.</p>
+          <p class="muted small">SV Studio swaps the lab's <code>BoardV3</code> for a model with the same ports and runs your design live with Verilator. Press keys and flip switches here and watch the displays and lights. <code>Clk_1Hz</code> and <code>Clk_1kHz</code> follow real time, and <code>Clk</code> runs as fast as your PC can simulate it.</p>
+        </div>
+        <div class="board-wrap" id="boardWrap" hidden>
+          <div class="pcb">
+            <div class="pcb-title">COMP12111 · Spartan-7 lab board <span class="muted">(virtual)</span></div>
+            <div class="pcb-section">
+              <div class="silk">Displays · Digit5 … Digit0</div>
+              <div class="displays" id="bdDisplays"></div>
+            </div>
+            <div class="pcb-cols">
+              <div class="pcb-section">
+                <div class="silk">Traffic lights</div>
+                <div class="traffic" id="bdTraffic"></div>
+              </div>
+              <div class="pcb-section">
+                <div class="silk">S7 LEDs · Buzzer</div>
+                <div class="misc-out">
+                  <div class="led-pair"><span class="led blue" id="bdS7_1"></span><span class="led blue" id="bdS7_0"></span></div>
+                  <div class="led-labels"><span>S7_leds[1]</span><span>[0]</span></div>
+                  <div class="buzzer" id="bdBuzzer" title="Buzzer"><svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></svg><span id="bdBuzzHz">off</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="pcb-cols">
+              <div class="pcb-section">
+                <div class="silk">Keypad · button[15:0] <span class="muted">(or type 0-9 / A-F)</span></div>
+                <div class="keypad" id="bdKeypad"></div>
+              </div>
+              <div class="pcb-section">
+                <div class="silk">Switches A–H · button[23:16] = <b id="bdSwHex">00</b></div>
+                <div class="switches" id="bdSwitches"></div>
+                <div class="silk" style="margin-top:14px">Simple buttons · Simple_buttons[3:0] <span class="muted">(shift-click latches)</span></div>
+                <div class="simple" id="bdSimple"></div>
+              </div>
+            </div>
+          </div>
+          <div class="mu0" id="mu0Panel" hidden>
+            <div class="mu0-head"><b>MU0</b> <span class="job-chip" id="mu0State">—</span><div class="spacer"></div><span class="muted small" id="mu0Count"></span></div>
+            <div class="mu0-regs">
+              <div><span>ACC</span><b id="mu0Acc">0000</b><i id="mu0AccDec"></i></div>
+              <div><span>PC</span><b id="mu0Pc">000</b></div>
+              <div><span>N</span><b id="mu0N">0</b></div>
+              <div><span>Z</span><b id="mu0Z">0</b></div>
+            </div>
+            <div class="mu0-ctl">
+              <button class="btn sm" id="mu0Reset" title="Reset MU0 (memory is kept)">Reset</button>
+              <button class="btn sm" id="mu0Step" title="Execute one instruction">Step</button>
+              <button class="btn primary sm" id="mu0Run">Run</button>
+              <button class="btn sm" id="mu0Stop">Stop</button>
+              <select id="mu0Hz" title="MU0 clock (proc_clk) speed">
+                <option value="1">1 Hz</option><option value="10" selected>10 Hz</option><option value="100">100 Hz</option>
+                <option value="1000">1 kHz</option><option value="10000">10 kHz</option><option value="0">Max</option>
+              </select>
+            </div>
+            <div class="mu0-ctl">
+              <select id="mu0MemFile" title="Memory image to load"></select>
+              <button class="btn sm" id="mu0Load" title="Write this .mem file into memory and reset">Load .mem</button>
+            </div>
+            <div class="mu0-memhead">
+              <span>Memory</span>
+              <input id="mu0Base" value="000" spellcheck="false" title="Start address (hex)">
+              <label class="check"><input type="checkbox" id="mu0Follow" checked> follow PC</label>
+            </div>
+            <div class="mu0-mem" id="mu0Mem"></div>
+            <div class="mu0-memhead"><span>Memory-mapped I/O</span></div>
+            <div class="mu0-io" id="mu0Io"></div>
           </div>
         </div>
       </div>
@@ -211,5 +298,6 @@
 <script src="editor.bundle.js"></script>
 <script src="wave.js"></script>
 <script src="app.js"></script>
+<script src="board.js"></script>
 </body>
 </html>

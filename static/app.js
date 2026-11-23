@@ -266,7 +266,7 @@ function setRunning(on, kind) {
   $("#btnCompile").disabled = on;
   const chip = $("#jobChip");
   chip.className = "job-chip" + (on ? " running" : "");
-  if (on) chip.textContent = kind === "compile" ? "Compiling…" : "Simulating…";
+  if (on) chip.textContent = kind === "compile" ? "Compiling…" : kind === "board" ? "Building board…" : "Simulating…";
 }
 
 async function startJob(kind) {
@@ -297,6 +297,14 @@ async function poll() {
       S.job = null;
       setRunning(false);
       renderProblems();
+      if (r.kind === "board") {
+        const chip = $("#jobChip");
+        chip.className = "job-chip " + (r.ok ? "ok" : "fail");
+        chip.textContent = (r.ok ? "Board live" : "Board build failed") + ` · ${r.elapsed}s`;
+        status(r.ok ? "Virtual lab board running" : "Board build failed" + (S.errors ? ` · ${S.errors} error(s)` : ""));
+        if (window.onBoardBuilt) window.onBoardBuilt(r.ok);
+        return;
+      }
       const chip = $("#jobChip");
       chip.className = "job-chip " + (r.ok ? "ok" : "fail");
       chip.textContent = (r.ok ? "Succeeded" : "Failed") + ` · ${r.elapsed}s`;
