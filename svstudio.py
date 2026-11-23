@@ -1068,7 +1068,44 @@ def _wsl_missing(job, names, pkg):
         if names[0] == "Verilator":
             job.log("Or pick Questa / Icarus in the Simulator menu instead.", "err")
     else:
-        job.log(f"{names[0]} not found on PATH. Install it with:  sudo apt install {pkg}", "err")
+        job.log(f"{names[0]} not found. Install it with:", "err")
+        job.log(f"    sudo apt update && sudo apt install {pkg}", "err")
+        job.log("then press Start / Simulate again. (Icarus works without installing anything, but the Board tab needs Verilator.)", "err")
+
+
+_VL_VER = {}
+
+
+def verilator_too_old(job, pre, root):
+    """Verilator 4 (e.g. Ubuntu 22.04's package) lacks --timing/--binary; explain how to get 5."""
+    key = " ".join(pre)
+    if key not in _VL_VER:
+        try:
+            r = subprocess.run(pre + ["--version"], capture_output=True, text=True, timeout=60, cwd=root,
+                               creationflags=0x08000000 if IS_WIN else 0)
+            m = re.search(r"Verilator (\d+)\.(\d+)", r.stdout)
+            _VL_VER[key] = (int(m.group(1)), int(m.group(2))) if m else None
+        except Exception:
+            _VL_VER[key] = None
+    v = _VL_VER[key]
+    if v and v[0] < 5:
+        job.log(f"Verilator {v[0]}.{v[1]:03d} is too old - SV Studio needs Verilator 5 or newer.", "err")
+        job.log("Ubuntu 22.04's package is version 4. Get Verilator 5 from the OSS CAD Suite:", "err")
+        job.log("    https://github.com/YosysHQ/oss-cad-suite-build/releases  (unpack it, then add its bin folder to PATH)", "err")
+        job.log("or upgrade to Ubuntu 24.04 (sudo apt install verilator gives version 5). Icarus works meanwhile.", "err")
+        return True
+    return False
+
+
+def _native_build_tools_missing(job, via_wsl):
+    if via_wsl or IS_WIN:
+        return False
+    missing = [t for t in ("make", "g++") if not shutil.which(t)]
+    if missing:
+        job.log(f"Verilator needs {' and '.join(missing)} to build the simulation. Install them with:", "err")
+        job.log("    sudo apt install build-essential", "err")
+        return True
+    return False
 
 
 def verilator_build(job, proj, top, runtime, lint_only=False):
@@ -1079,6 +1116,8 @@ def verilator_build(job, proj, top, runtime, lint_only=False):
         return False, None, False
     if via_wsl and not lint_only and not wsl_tool("make"):
         _wsl_missing(job, ["make / g++ (needed to build Verilator simulations)"], "build-essential")
+        return False, None, False
+    if not lint_only and (_native_build_tools_missing(job, via_wsl) or verilator_too_old(job, pre, str(root))):
         return False, None, False
     if via_wsl:
         job.log("Running Verilator inside WSL (first build on a Windows drive can take a while)…", "info")
@@ -1224,6 +1263,8 @@ def board_build(job, proj, top):
         return None
     if via_wsl and not wsl_tool("make"):
         _wsl_missing(job, ["make / g++ (needed to build the virtual board)"], "build-essential")
+        return None
+    if _native_build_tools_missing(job, via_wsl) or verilator_too_old(job, pre, str(root)):
         return None
     need, mods = _board_closure(proj, top)
     defining = {}
