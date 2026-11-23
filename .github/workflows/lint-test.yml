@@ -1,0 +1,45 @@
+name: lint-test
+on:
+  push:
+    branches: [ci-icarus-test]
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: exe lint
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:SVS_NO_UPDATE = "1"
+          $p = Start-Process -FilePath .\SVStudio.exe -ArgumentList "examples","--no-window","--port","8799" -PassThru
+          Start-Sleep -Seconds 8
+          $html = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8799/).Content
+          $tok = [regex]::Match($html, 'SVS_TOKEN = "([0-9a-f]+)"').Groups[1].Value
+          for ($i=0; $i -lt 10; $i++) {
+            $r = Invoke-WebRequest -UseBasicParsing -Method POST -Headers @{"X-SVS-Token"=$tok} -ContentType "application/json" -Body "{}" http://127.0.0.1:8799/api/lint
+            Write-Host $r.Content.Substring(0, [Math]::Min(400, $r.Content.Length))
+            if ($r.Content -match '"state": "ok"' -or $r.Content -match '"state": "off"') { break }
+            Start-Sleep -Seconds 3
+          }
+          Stop-Process -Id $p.Id -Force
+          Get-Content "$env:USERPROFILE\.svstudio.log" -ErrorAction SilentlyContinue
+          Get-ChildItem vendor
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: python 3.13 lint
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:SVS_NO_UPDATE = "1"
+          $p = Start-Process -FilePath python -ArgumentList "svstudio.py","examples","--no-window","--port","8798" -PassThru
+          Start-Sleep -Seconds 6
+          $html = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8798/).Content
+          $tok = [regex]::Match($html, 'SVS_TOKEN = "([0-9a-f]+)"').Groups[1].Value
+          for ($i=0; $i -lt 10; $i++) {
+            $r = Invoke-WebRequest -UseBasicParsing -Method POST -Headers @{"X-SVS-Token"=$tok} -ContentType "application/json" -Body "{}" http://127.0.0.1:8798/api/lint
+            Write-Host $r.Content.Substring(0, [Math]::Min(300, $r.Content.Length))
+            if ($r.Content -match '"state": "ok"' -or $r.Content -match '"state": "off"') { break }
+            Start-Sleep -Seconds 3
+          }
+          Stop-Process -Id $p.Id -Force
