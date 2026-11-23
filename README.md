@@ -1,30 +1,116 @@
 # SV Studio
 
-A modern desktop front end for SystemVerilog projects. Open a Questa/ModelSim project (`.mpf`) or a folder of `.sv` files, compile, simulate, view waveforms, and jump to errors or edit files in VS Code.
+A modern desktop IDE for SystemVerilog, built for the University of Manchester COMP12111 labs
+but usable for any SystemVerilog project. Open a Questa/ModelSim project (`.mpf`) or a folder of
+`.sv` files, then edit, compile, simulate and view waveforms in one window.
 
-- **Simulators:** Questa / ModelSim (including the free Questa Starter Edition), Verilator 5+, Icarus Verilog
-- **Waveform viewer built in:** no GTKWave needed
-- **Editor built in** with IDE features, plus one-click **Open in VS Code** (at the right line)
-- Only needs Python 3.8+ and no extra packages
+- **Simulators:** Icarus Verilog (built in, no install needed), Verilator 5+, Questa / ModelSim
+- **Built-in editor** with errors underlined as you type, autocomplete, go-to-definition and tabs
+- **Waveform viewer** built in, so no GTKWave is needed
+- **Virtual lab board:** run `*_Board` designs live with the keypad, switches, displays and traffic lights,
+  and step through MU0 programs
+- **FPGA timing** results from Vivado, or from your lab build logs
+- **Updates itself** from this GitHub repo
 
-## Install
+---
 
-1. Install **Python 3** from python.org. On Windows, tick *"Add python.exe to PATH"*.
-2. Install at least one simulator:
-   - **Questa Starter Edition** (free, same tool as the university labs). Download it with Quartus Prime Lite from the Altera FPGA download centre, and generate the free `SW-QUESTA` licence in the Self-Service Licensing Center.
-   - **Icarus Verilog**: Windows installer at bleyer.org/icarus, or `sudo apt install iverilog`.
-   - **Verilator** (Linux only, so on Windows it runs inside WSL): in an admin PowerShell run `wsl --install` and reboot. Then open *Ubuntu* and run `sudo apt update && sudo apt install verilator build-essential`. SV Studio on Windows detects it inside WSL automatically. Icarus installed in WSL (`sudo apt install iverilog`) is picked up the same way.
-3. Install **VS Code** and make sure the `code` command works (the installer adds it to PATH).
-4. Unzip SV Studio anywhere, e.g. `Documents\SV Studio`.
+## Quick start
 
-## Run
+| | Windows 10/11 | Linux (Ubuntu 22.04+, x86-64) |
+|---|---|---|
+| 1. Download | [**Download ZIP**](https://github.com/Shoro123456789/System-Verilog-editor/archive/refs/heads/main.zip) and unzip it, e.g. to `Documents\SV Studio` | `git clone https://github.com/Shoro123456789/System-Verilog-editor.git` |
+| 2. Start | Double-click **`SVStudio.exe`** | `cd System-Verilog-editor && ./svstudio.sh` |
+| 3. Open a project | **Open** → pick your project folder or `.mpf` | same |
+| 4. Simulate | Choose the testbench under **Top** and press **Simulate** (Icarus works straight away) | same |
 
-- **Windows:** double-click **`SV Studio.bat`**. A window opens (Edge/Chrome app mode).
-  If nothing happens, use `SV Studio (debug console).bat` to see the error.
-- **Linux / macOS / WSL:** `./svstudio.sh` (optionally followed by a project path).
-- Command line: `python svstudio.py path\to\project.mpf`
+On both systems that's enough for editing, live error checking and simulating with Icarus. Everything
+below is optional extra setup.
 
-The app quits on its own a few minutes after you close its window. Optionally, `pip install pywebview` gives a true native window instead of the browser app window.
+---
+
+## Windows: full setup
+
+### 1. Install SV Studio
+1. Download the [ZIP](https://github.com/Shoro123456789/System-Verilog-editor/archive/refs/heads/main.zip) (or clone the repo) and
+   unzip it somewhere you'll keep it. Unzip it first rather than running it from inside the zip.
+2. Double-click **`SVStudio.exe`**. Python is built in, so nothing else is needed.
+   - The first time, Windows SmartScreen may say *"Windows protected your PC"*, because the exe isn't
+     code-signed. Click **More info → Run anyway**.
+   - Keep `SVStudio.exe` next to its `runtime` folder and the rest of the files.
+   - To get a shortcut, right-click `SVStudio.exe` → *Pin to Start* / *Pin to taskbar*.
+3. *(Alternative)* If you have Python 3.11+ from [python.org](https://www.python.org/downloads/) with *"Add python.exe to PATH"*
+   ticked, you can start it with **`SV Studio.bat`** instead. If that window closes straight away, use
+   `SV Studio (debug console).bat` to see why.
+
+### 2. Simulators (optional: Icarus is already built in)
+- **Verilator** is faster, and it's needed for the **Board** tab. It runs inside WSL:
+  1. Open PowerShell **as Administrator**, run `wsl --install`, and restart the PC.
+  2. Open **Ubuntu** from the Start menu, create a user, then run:
+     ```bash
+     sudo apt update && sudo apt install -y verilator build-essential
+     ```
+  3. Restart SV Studio. It finds Verilator inside WSL automatically, and the status bar shows *Verilator (WSL)*.
+- **Questa Starter Edition** is free and the same simulator the labs use. Install *Questa – Intel FPGA Starter
+  Edition* with Quartus Prime Lite from the Altera download centre, then get the free `SW-QUESTA`
+  licence from the Altera Self-Service Licensing Center. In SV Studio, **⚙ Settings** → set *Questa bin folder* (e.g.
+  `C:\altera_lite\25.1std\questa_fse\win64`) and *Questa license file*.
+
+### 3. Other optional tools
+- **VS Code**: install it normally. The **Open in VS Code** button then opens files at the right line.
+- **Vivado** gives real FPGA timing results in the **Timing** tab. The free *Vivado ML Standard* edition supports Spartan-7. SV
+  Studio finds it in `C:\Xilinx\…` or `C:\AMDDesignTools\…`, or you can set its path in Settings.
+
+---
+
+## Linux: full setup (Ubuntu / Debian)
+
+### 1. Install SV Studio
+```bash
+sudo apt install -y git python3 python3-tk          # python3-tk gives the Browse… file dialogs
+git clone https://github.com/Shoro123456789/System-Verilog-editor.git ~/SVStudio
+cd ~/SVStudio
+./svstudio.sh                                        # optionally followed by a project path
+```
+It opens in Chrome/Chromium "app mode" if either is installed, otherwise in your default browser.
+Python 3.11+ is recommended (Ubuntu 24.04 has 3.12). With older Python it still works, but live
+error checking installs itself with pip the first time.
+
+**No sudo?** (e.g. a shared university machine) SV Studio still runs with the system `python3`. The
+built-in Icarus works, and you can download the repo as a ZIP instead of using git.
+
+### 2. Simulators (optional: Icarus is already built in)
+```bash
+sudo apt install -y verilator build-essential       # Verilator: faster, and needed for the Board tab
+sudo apt install -y iverilog                         # optional: a system Icarus is used instead of the built-in one
+```
+- Ubuntu **24.04** ships Verilator 5, which works. Ubuntu **22.04** ships Verilator 4, which is **too old** for SV Studio.
+  On 22.04, install Verilator 5 from the [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build/releases)
+  (unpack it and add its `bin` folder to `PATH`), or just use Icarus.
+- **Questa** and **Vivado** for Linux are detected the same way as on Windows, and you can set their paths in ⚙ Settings.
+
+### 3. Other distributions
+Fedora, Arch and others work too. Install `python3`, `tkinter`, and optionally `verilator`, `make` and
+`gcc-c++` with your package manager. The built-in Icarus and live check need **x86-64** and glibc 2.35 or newer.
+On other CPUs, install `iverilog` from your package manager.
+
+---
+
+## Updating
+SV Studio checks this repo every time it starts and installs updates automatically. While it's
+running, an **Update & restart** bar appears when there's something new. **⚙ Settings → Updates**
+lets you choose *automatic*, *ask first* or *never*. If you cloned with git, it runs `git pull` instead.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| *"Windows protected your PC"* | **More info → Run anyway**. The exe just isn't code-signed. |
+| *Failed to start embedded python interpreter* | Make sure the `runtime` folder is next to `SVStudio.exe` and you unzipped the whole download, or use `SV Studio.bat`. |
+| *Verilator not found* on Windows | Install it **inside WSL** (see above), then restart SV Studio. |
+| *GNU Make cannot build in directories containing spaces* | Already handled: SV Studio builds inside WSL's home folder. Update SV Studio if you still see this. |
+| *Live check off* (status bar) | Hover over the chip to see the reason, and click it to retry. It needs Python 3.11+ when started with Python yourself. |
+| Missing Xilinx primitives (`AND4B3`, `FDC`, `ICAPE2`…) | SV Studio supplies built-in models automatically for Verilator and Icarus. |
+| Nothing happens on start (Windows) | Run `SV Studio (debug console).bat`, or read `%USERPROFILE%\.svstudio.log`. |
 
 ## Using it
 
@@ -91,13 +177,14 @@ defaults. The *Live check* chip in the status bar shows whether it's running.
 slang ships with SV Studio as a Python wheel in `vendor/` (Windows and Linux, x86-64, Python 3.11+).
 On other systems SV Studio installs it once with `pip install --user pyslang`.
 
-## Built-in Icarus Verilog (Windows)
+## Built-in Icarus Verilog
 
-On Windows SV Studio includes Icarus Verilog 13 (`tools/iverilog-win`), so the **Icarus** simulator
-works with nothing else installed: no WSL and no separate download. An `iverilog` on your PATH is
-used instead if you have one, and the built-in copy can be switched off in Settings. Icarus is GPL
-software; see `tools/iverilog-win/README.txt` for the source and build details. Verilator (for speed
-and the Board tab) and Questa remain optional.
+SV Studio includes Icarus Verilog 13 for **Windows** (`tools/iverilog-win`) and **Linux x86-64**
+(`tools/iverilog-linux`, built on Ubuntu 22.04). So the **Icarus** simulator works with nothing else
+installed: no WSL, no apt, no download. An `iverilog` on your PATH is used instead if you have one, and
+the built-in copy can be switched off in Settings. Icarus is GPL software. See `README.txt` in those
+folders for the source and build details. The builds are reproducible from
+`.github/workflows/build-icarus-linux.yml`, and `tools/iverilog-win/README.txt` describes the Windows build.
 
 ## Virtual lab board (COMP12111)
 
@@ -144,24 +231,15 @@ The **Timing** tab shows whether a design meets timing on the lab board's Sparta
   or from SV Studio's built-in copy of the board pinout. These approximate the lab's timing
   constraints, which aren't public, so the numbers can differ slightly from a lab build.
 
-## SVStudio.exe (Windows)
+## SVStudio.exe and updates (details)
 
-Double-click **SVStudio.exe** to start SV Studio. It has Python built in, so nothing needs installing.
-Keep it inside the SV Studio folder, together with its `runtime` folder: it runs the `svstudio.py` next to it, which is what lets the
-app update itself. The exe is built automatically on GitHub (`.github/workflows/build-exe.yml`). It
-isn't code-signed, so the first time you run it Windows SmartScreen may say "Windows protected your
-PC". Click *More info → Run anyway*. `SV Studio.bat` still works if you'd rather use your own Python.
+`SVStudio.exe` is a small launcher with Python built in (PyInstaller, one-folder build in `runtime/`).
+It runs the `svstudio.py` next to it, which is what lets SV Studio update itself by replacing plain
+files. It's built and smoke-tested on Windows by `.github/workflows/build-exe.yml` whenever `launcher/`
+changes. Closing the SV Studio window shuts everything down, so no Python process is left running.
 
-Closing the SV Studio window shuts it down completely; no Python process is left running.
-
-## Updates
-
-SV Studio updates itself from this GitHub repo. By default, when it starts it checks for a newer
-version and installs it before opening. If an update appears while it's running, a bar offers
-**Update & restart**, and you can also run *Check for updates* from the command palette (F1).
-**Settings → Updates** switches between installing automatically, asking first, and never checking.
-Updating replaces the app's files with the latest `main`, so local edits to SV Studio's own files are
-overwritten. A git checkout is updated with `git pull --ff-only` instead.
+Updates replace the app's own files with the latest `main` (your projects are never touched). Local
+edits to SV Studio's files are overwritten, so to hack on SV Studio, use a git clone.
 
 ## Settings (⚙)
 
