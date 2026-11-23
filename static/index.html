@@ -43,6 +43,15 @@
     <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
   </button>
 </header>
+<div class="update-bar" id="updateBar" hidden>
+  <span class="ub-dot"></span>
+  <span id="updateText">An update for SV Studio is available.</span>
+  <button class="btn ghost sm" id="updateWhat">What's new</button>
+  <button class="btn primary sm" id="updateGo">Update &amp; restart</button>
+  <button class="icon-btn sm" id="updateClose" title="Later"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  <div class="ub-list" id="updateList" hidden></div>
+</div>
+<div class="restart-overlay" id="restartOverlay" hidden><div><div class="spinner"></div><h3 id="restartTitle">Updating SV Studio…</h3><p class="muted" id="restartSub">Downloading the latest version from GitHub.</p></div></div>
 
 <div class="layout">
   <aside class="sidebar">
@@ -302,6 +311,10 @@
       <label>Extra Verilator flags<input data-cfg="verilator_flags"></label>
       <label>Extra iverilog flags<input data-cfg="iverilog_flags"></label>
       <label class="check"><input type="checkbox" data-cfg="compile_before_sim"> Compile before every simulation (Questa)</label>
+      <label>Updates<select data-cfg="auto_update">
+        <option value="auto">Install automatically when SV Studio starts</option>
+        <option value="notify">Ask me first</option>
+        <option value="off">Never check</option></select></label>
       <label class="check"><input type="checkbox" data-cfg="use_bundled_icarus"> Use SV Studio's built-in Icarus Verilog on Windows (no install needed)</label>
     </div>
     <div class="detected" id="detected"></div>
@@ -327,5 +340,6 @@
 <script src="board.js"></script>
 <script src="timing.js"></script>
 <script src="lint.js"></script>
+<script src="update.js"></script>
 </body>
 </html>

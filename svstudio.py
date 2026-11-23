@@ -56,7 +56,8 @@ DEFAULT_CONFIG = {
     "vsim_flags": "",
     "verilator_flags": "",
     "iverilog_flags": "",
-    "use_bundled_icarus": True,  # Windows: use the Icarus Verilog that ships with SV Studio
+    "use_bundled_icarus": True,
+    "auto_update": "auto",      # "auto" (install updates when SV Studio starts), "notify" or "off"  # Windows: use the Icarus Verilog that ships with SV Studio
     "vivado_path": "",          # vivado / vivado.bat (auto-detected if empty)
     "compile_before_sim": True,
     "recent": [],
@@ -2024,6 +2025,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not job:
                     return self._send(404, {"error": "no such job"})
                 return self._send(200, job.snapshot(int(q.get("since", 0))))
+            if u.path == "/api/update/check":
+                if CONFIG.get("auto_update", "auto") == "off" and not q.get("force"):
+                    return self._send(200, {"available": False, "mode": "off", "current": local_commit()})
+                return self._send(200, check_update(force=bool(q.get("force"))))
             if u.path == "/api/timing/info":
                 proj = STATE["project"]
                 if not proj:
@@ -2107,6 +2112,13 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS[job.id] = job
                 threading.Thread(target=board_worker, daemon=True, args=(job, proj, top)).start()
                 return self._send(200, {"id": job.id, "project": proj})
+            if u.path == "/api/update/apply":
+                if any(not j.done for j in JOBS.values()):
+                    return self._send(409, {"error": "Wait for the running job to finish first"})
+                job = Job("update")
+                JOBS[job.id] = job
+                threading.Thread(target=update_worker, daemon=True, args=(job,)).start()
+                return self._send(200, {"id": job.id})
             if u.path == "/api/timing/run":
                 proj = STATE["project"]
                 if not proj:
@@ -2199,8 +2211,203 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "unknown endpoint"})
 
 
+# --------------------------------------------------------------------------- self-update from GitHub
+UPDATE_REPO = "Shoro123456789/System-Verilog-editor"
+UPDATE_BRANCH = "main"
+UPDATE = {"checked": 0.0, "info": None, "lock": threading.Lock(), "applying": False}
+UPDATE_SKIP = {".git", ".github", "__pycache__"}
+
+
+def local_commit():
+    """Commit SV Studio was installed from: written by the updater, substituted into version.txt by
+    GitHub/git archive downloads, or read from a git checkout."""
+    p = APP_DIR / ".svs_commit"
+    if p.exists():
+        v = p.read_text(errors="replace").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", v):
+            return v
+    p = APP_DIR / "version.txt"
+    if p.exists():
+        v = p.read_text(errors="replace").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", v):
+            return v
+    if (APP_DIR / ".git").exists() and shutil.which("git"):
+        try:
+            r = subprocess.run(["git", "-C", str(APP_DIR), "rev-parse", "HEAD"], capture_output=True, text=True,
+                               timeout=10, creationflags=0x08000000 if IS_WIN else 0)
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception:
+            pass
+    return None
+
+
+def _gh_get(url, accept="application/vnd.github+json", timeout=8):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": f"SVStudio/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def check_update(force=False):
+    with UPDATE["lock"]:
+        if not force and UPDATE["info"] and time.time() - UPDATE["checked"] < 1800:
+            return UPDATE["info"]
+        cur = local_commit()
+        info = {"current": cur, "latest": None, "available": False, "commits": [], "error": None,
+                "git": (APP_DIR / ".git").exists(), "mode": CONFIG.get("auto_update", "auto")}
+        try:
+            c = json.loads(_gh_get(f"https://api.github.com/repos/{UPDATE_REPO}/commits/{UPDATE_BRANCH}"))
+            info["latest"] = c["sha"]
+            info["date"] = c["commit"]["committer"]["date"]
+            info["available"] = cur != c["sha"]
+            if info["available"] and cur:
+                try:
+                    cmp = json.loads(_gh_get(f"https://api.github.com/repos/{UPDATE_REPO}/compare/{cur}...{c['sha']}"))
+                    info["commits"] = [x["commit"]["message"].splitlines()[0] for x in cmp.get("commits", [])][-20:]
+                    if cmp.get("status") == "behind":   # local is newer than GitHub (e.g. a dev checkout)
+                        info["available"] = False
+                except Exception:
+                    pass
+            if info["available"] and not info["commits"]:
+                info["commits"] = [c["commit"]["message"].splitlines()[0]]
+        except Exception as e:
+            info["error"] = f"Couldn't check for updates: {e}"
+        UPDATE["info"], UPDATE["checked"] = info, time.time()
+        return info
+
+
+def apply_update(log=print):
+    """Download the latest version from GitHub and copy it over this installation."""
+    import io
+    import zipfile
+    info = check_update(force=True)
+    if info.get("error"):
+        raise RuntimeError(info["error"])
+    if not info["available"]:
+        log("Already up to date.")
+        return False
+    sha = info["latest"]
+    if info["git"] and shutil.which("git"):
+        log("Updating the git checkout (git pull)…")
+        r = subprocess.run(["git", "-C", str(APP_DIR), "pull", "--ff-only"], capture_output=True, text=True,
+                           timeout=180, creationflags=0x08000000 if IS_WIN else 0)
+        log((r.stdout + r.stderr).strip())
+        if r.returncode != 0:
+            raise RuntimeError("git pull failed - you may have local changes. Update manually.")
+        return True
+    log(f"Downloading {UPDATE_REPO} @ {sha[:7]}…")
+    data = _gh_get(f"https://codeload.github.com/{UPDATE_REPO}/zip/{sha}", accept="*/*", timeout=120)
+    z = zipfile.ZipFile(io.BytesIO(data))
+    names = [n for n in z.namelist() if not n.endswith("/")]
+    prefix = names[0].split("/", 1)[0] + "/"
+    if "svstudio.py" not in {n[len(prefix):] for n in names}:
+        raise RuntimeError("Downloaded archive doesn't look like SV Studio")
+    changed = 0
+    for n in names:
+        rel = n[len(prefix):]
+        if not rel or rel.split("/", 1)[0] in UPDATE_SKIP:
+            continue
+        dest = APP_DIR / rel
+        content = z.read(n)
+        if rel == "version.txt":
+            content = (sha + "\n").encode()
+        try:
+            if dest.exists() and dest.read_bytes() == content:
+                continue
+        except OSError:
+            pass
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".svs_new")
+        tmp.write_bytes(content)
+        try:
+            os.replace(tmp, dest)
+        except OSError as e:   # e.g. a bundled .exe that is running right now
+            tmp.unlink(missing_ok=True)
+            log(f"Couldn't replace {rel}: {e}")
+            continue
+        changed += 1
+    (APP_DIR / ".svs_commit").write_text(sha + "\n")
+    log(f"Updated {changed} file(s) to {sha[:7]}.")
+    with UPDATE["lock"]:
+        UPDATE["info"] = None
+    return True
+
+
+RUN = {"args": None, "mode": None, "port": None, "httpd": None}
+
+
+def restart_app():
+    """Start a fresh SV Studio process (running the updated code) and exit this one."""
+    a = RUN["args"]
+    argv = [sys.executable, str(APP_DIR / "svstudio.py")]
+    if a and a.project:
+        argv.append(a.project)
+    if RUN["mode"] == "webview" or (a and a.no_window):
+        argv += (["--no-window"] if a and a.no_window else []) + ["--port", str(RUN["port"]), "--wait-port"]
+    else:   # the old window stays open and reloads itself once the new server answers
+        argv += ["--port", str(RUN["port"]), "--wait-port", "--reuse-window"]
+    if a and a.keep_alive:
+        argv.append("--keep-alive")
+    if BOARD["session"]:
+        BOARD["session"].stop()
+    for j in JOBS.values():
+        if not j.done:
+            kill_job(j)
+    kw = {"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {"start_new_session": True}
+    subprocess.Popen(argv, cwd=str(APP_DIR), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True, env=dict(os.environ, SVS_NO_UPDATE="1"), **kw)
+    if RUN["httpd"]:
+        threading.Thread(target=RUN["httpd"].shutdown, daemon=True).start()
+    time.sleep(0.4)
+    os._exit(0)
+
+
+def update_worker(job):
+    try:
+        job.log(f"{APP_NAME} · updating from github.com/{UPDATE_REPO}", "info")
+        changed = apply_update(lambda m: job.log(m, "info"))
+        job.ok = True
+        job.restart = changed
+        if changed:
+            job.log("Restarting SV Studio…", "info")
+    except Exception as e:
+        job.log(f"Update failed: {e}", "err")
+        job.ok = False
+    finally:
+        job.log("✔ Update finished" if job.ok else "✖ Update failed", "done-ok" if job.ok else "done-err")
+        job.done = True
+        if job.ok and getattr(job, "restart", False):
+            threading.Timer(1.0, restart_app).start()
+
+
+def startup_update():
+    """With auto_update = "auto", install a pending update before the app starts (then re-launch)."""
+    if CONFIG.get("auto_update", "auto") != "auto" or os.environ.get("SVS_NO_UPDATE"):
+        return False
+    try:
+        info = check_update(force=True)
+        if info.get("available") and not info.get("error"):
+            print(f"Updating SV Studio to {info['latest'][:7]}…")
+            return apply_update()
+    except Exception as e:
+        print("Auto-update skipped:", e)
+    return False
+
+
 # --------------------------------------------------------------------------- window
-def _free_port(preferred):
+def _free_port(preferred, wait=False):
+    if wait:   # restarting after an update: wait for the old process to release the port
+        for _ in range(60):
+            try:
+                s = socket.socket()
+                if not IS_WIN:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", preferred))
+                s.close()
+                return preferred
+            except OSError:
+                time.sleep(0.25)
     for port in list(range(preferred, preferred + 10)) + [0]:
         try:
             s = socket.socket()
@@ -2251,11 +2458,19 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-window", action="store_true", help="don't open a window, just print the URL")
     ap.add_argument("--keep-alive", action="store_true", help="keep running after the window is closed")
+    ap.add_argument("--wait-port", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--reuse-window", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if sys.stdout is None:  # started with pythonw (no console): log to a file instead
         log = open(Path.home() / ".svstudio.log", "a", encoding="utf-8", buffering=1)
         sys.stdout = sys.stderr = log
+
+    if startup_update():   # updated on disk: run the new version instead
+        env = dict(os.environ, SVS_NO_UPDATE="1")
+        kw = {"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {}
+        subprocess.Popen([sys.executable, str(APP_DIR / "svstudio.py")] + sys.argv[1:], cwd=str(APP_DIR), env=env, **kw)
+        return
 
     if args.project:
         try:
@@ -2267,14 +2482,15 @@ def main():
         threading.Thread(target=lambda: [wsl_tool(n) for n in ("verilator", "iverilog", "make")], daemon=True).start()
     threading.Thread(target=lint_init, daemon=True).start()
 
-    port = _free_port(args.port)
+    port = _free_port(args.port, wait=args.wait_port)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     print(f"{APP_NAME} {VERSION} running at {url}  (Ctrl+C to quit)")
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
 
-    mode, webview = ("none", None) if args.no_window else open_window(url)
+    mode, webview = ("none", None) if (args.no_window or args.reuse_window) else open_window(url)
+    RUN.update(args=args, mode=mode, port=httpd.server_address[1], httpd=httpd)
     try:
         if mode == "webview":
             webview.create_window(APP_NAME, url, width=1500, height=920, min_size=(1000, 640))

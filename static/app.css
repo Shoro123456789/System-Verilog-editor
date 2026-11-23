@@ -516,3 +516,15 @@ body.resizing * { cursor: col-resize !important; }
 #lintChip.on::before { background: var(--ok); }
 #lintChip.busy::before { background: var(--warn); animation: pulse 1s infinite; }
 .pitem.live .sev::after { content: "live"; font-size: 9px; margin-left: 4px; color: var(--accent2); vertical-align: 1px; }
+
+/* ---------- updates */
+.update-bar { position: relative; display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: linear-gradient(90deg, rgba(124, 92, 255, .22), rgba(34, 211, 238, .12)); border-bottom: 1px solid var(--line); font-size: 13px; flex: none; }
+.update-bar .ub-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
+.update-bar #updateText { flex: 1; }
+.ub-list { position: absolute; top: 100%; right: 60px; z-index: 50; width: 460px; max-height: 320px; overflow: auto; background: var(--panel); border: 1px solid var(--line2); border-radius: 10px; padding: 10px 14px; box-shadow: 0 20px 40px -10px rgba(0, 0, 0, .7); }
+.ub-list ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
+.ub-list li { margin: 3px 0; }
+.restart-overlay { position: fixed; inset: 0; z-index: 1000; background: rgba(8, 10, 15, .82); display: grid; place-items: center; text-align: center; backdrop-filter: blur(3px); }
+.restart-overlay h3 { margin: 14px 0 4px; }
+.spinner { width: 34px; height: 34px; margin: 0 auto; border-radius: 50%; border: 3px solid var(--line2); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
