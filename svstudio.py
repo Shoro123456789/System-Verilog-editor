@@ -1710,40 +1710,52 @@ def _try_import_pyslang():
 
 
 def _vendored_pyslang():
-    """Unpack the pyslang wheel shipped with SV Studio (Windows / Linux x86-64, Python 3.11+)."""
+    """Unpack the pyslang wheel shipped with SV Studio (Windows / Linux x86-64, Python 3.11+), plus the
+    nanobind_backend wheel it needs for this Python version, and import it."""
     if sys.version_info < (3, 11):
+        LINT["msg"] = f"Python {sys.version_info.major}.{sys.version_info.minor} is too old for the built-in slang (needs 3.11+)"
         return None
     plat = "win_amd64" if IS_WIN else "manylinux" if sys.platform.startswith("linux") else None
     if not plat or platform.machine().lower() not in ("amd64", "x86_64"):
         return None
-    wheels = sorted(VENDOR_DIR.glob(f"pyslang-*{plat}*.whl"))
-    if not wheels:
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    slang = sorted(VENDOR_DIR.glob(f"pyslang-*{plat}*.whl"))
+    nb = sorted(VENDOR_DIR.glob(f"nanobind_backend-*-{tag}-*{plat}*.whl"))
+    if not slang:
         return None
-    whl = wheels[-1]
+    if not nb:
+        LINT["msg"] = f"No built-in slang support for Python {sys.version_info.major}.{sys.version_info.minor}"
+        return None
+    import zipfile
+    name = "lib_" + slang[-1].stem.split("-")[1] + "_" + tag + "_" + plat
+    err = None
     for base in (VENDOR_DIR, Path.home() / ".svstudio_vendor"):
-        dest = base / ("lib_" + whl.stem)
+        dest = base / name
         try:
-            if not (dest / "pyslang").exists():
-                import zipfile
+            if not (dest / "pyslang").exists() or not (dest / "nanobind_backend").exists():
                 tmp = dest.with_name(dest.name + ".tmp")
                 shutil.rmtree(tmp, ignore_errors=True)
-                with zipfile.ZipFile(whl) as z:
-                    z.extractall(tmp)
+                for whl in (slang[-1], nb[-1]):
+                    with zipfile.ZipFile(whl) as z:
+                        z.extractall(tmp)
                 shutil.rmtree(dest, ignore_errors=True)
                 tmp.rename(dest)
             if str(dest) not in sys.path:
                 sys.path.insert(0, str(dest))
-            mod = _try_import_pyslang()
-            if mod:
-                return mod
-        except Exception:
+            import pyslang  # noqa
+            return pyslang
+        except Exception as e:
+            err = e
             continue
+    if err:
+        LINT["msg"] = f"Couldn't load the built-in slang: {err}"
     return None
 
 
 def _pip_install_pyslang():
     if FROZEN:   # SVStudio.exe: no pip, and the bundled wheel should already have worked
-        LINT["state"], LINT["msg"] = "off", "Live checking unavailable (couldn't load the bundled slang)"
+        LINT["state"] = "off"
+        LINT["msg"] = "Live checking unavailable. " + (LINT["msg"] or "Couldn't load the built-in slang.")
         return
     LINT["installing"] = True
     LINT["state"], LINT["msg"] = "installing", "Installing the slang checker (pip install pyslang)…"
@@ -1764,7 +1776,7 @@ def _pip_install_pyslang():
             LINT["mod"], LINT["state"], LINT["msg"] = mod, "ok", "slang " + getattr(mod, "__version__", "")
         else:
             LINT["state"] = "off"
-            LINT["msg"] = "Live checking unavailable: couldn't install pyslang (" + \
+            LINT["msg"] = (LINT["msg"] + ". " if LINT["msg"] else "") + "Couldn't install pyslang with pip (" + \
                 ((r.stderr or r.stdout).strip().splitlines() or ["pip failed"])[-1][:200] + ")"
     except Exception as e:
         LINT["state"], LINT["msg"] = "off", f"Live checking unavailable: {e}"
@@ -1772,10 +1784,11 @@ def _pip_install_pyslang():
         LINT["installing"] = False
 
 
-def lint_init():
+def lint_init(retry=False):
     with LINT["lock"]:
-        if LINT["mod"] or LINT["installing"]:
+        if LINT["mod"] or LINT["installing"] or (LINT["state"] == "off" and not retry):
             return
+        LINT["msg"] = ""
         mod = _try_import_pyslang() or _vendored_pyslang()
         if mod:
             LINT["mod"], LINT["state"], LINT["msg"] = mod, "ok", "slang " + getattr(mod, "__version__", "")
@@ -2183,7 +2196,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not proj:
                     return self._send(200, {"state": "noproject", "diags": {}})
                 if not LINT["mod"]:
-                    lint_init()
+                    lint_init(retry=bool(b.get("retry")))
                     return self._send(200, {"state": LINT["state"], "msg": LINT["msg"], "diags": None})
                 t0 = time.time()
                 with LINT["lock"]:

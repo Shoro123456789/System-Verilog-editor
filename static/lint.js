@@ -15,8 +15,16 @@ function setLintChip(r) {
   LINT.state = r.state;
   c.className = "chip " + (r.state === "ok" ? "on" : r.state === "installing" || r.state === "unknown" ? "busy" : "");
   c.textContent = r.state === "ok" ? "Live check" : r.state === "installing" ? "Live check: installing…" : r.state === "unknown" ? "Live check: starting…" : "Live check off";
-  c.title = r.state === "ok" ? `Errors are checked as you type (${r.msg}${r.ms !== undefined ? `, ${r.ms} ms` : ""})` : (r.msg || "");
+  c.title = r.state === "ok" ? `Errors are checked as you type (${r.msg}${r.ms !== undefined ? `, ${r.ms} ms` : ""})` :
+    r.state === "off" ? (r.msg || "Live checking is unavailable") + " — click to try again" : (r.msg || "");
+  c.style.cursor = r.state === "off" ? "pointer" : "default";
 }
+
+$("#lintChip").onclick = async () => {
+  if (LINT.state !== "off") return;
+  try { setLintChip(await api("/api/lint", { retry: true })); } catch (e) {}
+  scheduleLint(1500);
+};
 
 async function runLint() {
   if (!S.project) return;
