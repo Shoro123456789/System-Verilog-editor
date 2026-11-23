@@ -70,9 +70,11 @@ jobs:
           find art -maxdepth 4 | head -20
           VPI=$(dirname "$(find art -path '*win/svs_board.vpi' | head -1)")
           TOP=$(find art -name top.sv | head -1)
-          I=$PWD/tools/iverilog-win
-          $I/bin/iverilog.exe -B $I/lib/ivl -g2012 -o t.vvp -s svs_board_top board/BoardV3_virtual.sv "$TOP"
-          (sleep 2; echo "b 7"; sleep 3; echo quit) | $I/bin/vvp.exe -M $I/lib/ivl -M "$VPI" -m svs_board -n t.vvp > out.txt
+          # Windows-style paths, as SV Studio passes them (Icarus runs its helpers through cmd.exe)
+          I=$(cygpath -w "$PWD/tools/iverilog-win")
+          VPIW=$(cygpath -w "$VPI")
+          "$I\bin\iverilog.exe" -B "$I\lib\ivl" -g2012 -o t.vvp -s svs_board_top board/BoardV3_virtual.sv "$TOP"
+          (sleep 2; echo "b 7"; sleep 3; echo quit) | "$I\bin\vvp.exe" -M "$I\lib\ivl" -M "$VPIW" -m svs_board -n t.vvp > out.txt
           head -c 400 out.txt; echo
           grep -q '"d":\[7,' out.txt && echo "Windows board VPI OK"
   commit:
