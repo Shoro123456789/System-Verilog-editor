@@ -1984,7 +1984,7 @@ def _allowed(path, root):
 MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon"}
 
-STATE = {"project": None, "last_ping": 0.0, "bye": 0.0}
+STATE = {"project": None, "last_ping": 0.0, "bye": 0.0, "streams": 0, "had_stream": False, "stream_end": 0.0}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2016,6 +2016,27 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
+    def _alive_stream(self):
+        """The window keeps this request open; when the window closes the connection drops, which is
+        how SV Studio knows to shut down (a reload reconnects within a moment)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        STATE["streams"] += 1
+        STATE["had_stream"] = True
+        STATE["last_ping"] = time.time()
+        try:
+            while True:
+                self.wfile.write(b": alive\n\n")
+                self.wfile.flush()
+                time.sleep(1)
+        except Exception:
+            pass
+        finally:
+            STATE["streams"] -= 1
+            STATE["stream_end"] = time.time()
+
     def do_GET(self):
         if not self._host_ok():
             return self._send(403, {"error": "bad host"})
@@ -2030,6 +2051,8 @@ class Handler(BaseHTTPRequestHandler):
             if f.name == "index.html":
                 data = data.replace(b"__SVS_TOKEN__", TOKEN.encode())
             return self._send(200, data, MIME.get(f.suffix, "application/octet-stream"))
+        if u.path == "/api/alive" and q.get("token") == TOKEN:
+            return self._alive_stream()
         if not self._api_ok():
             return self._send(403, {"error": "forbidden"})
         try:
@@ -2525,7 +2548,8 @@ def main():
                 if args.keep_alive or args.no_window:
                     continue
                 now = time.time()
-                closed = STATE["bye"] and now - STATE["bye"] > 4 and STATE["last_ping"] < STATE["bye"]
+                closed = (STATE["bye"] and now - STATE["bye"] > 4 and STATE["last_ping"] < STATE["bye"]) or \
+                    (STATE["had_stream"] and STATE["streams"] == 0 and now - STATE["stream_end"] > 4)
                 idle = STATE["last_ping"] and now - STATE["last_ping"] > 180
                 busy = any(not j.done for j in JOBS.values())
                 if closed or (idle and not busy):

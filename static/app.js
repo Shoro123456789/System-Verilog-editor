@@ -844,5 +844,10 @@ window.addEventListener("beforeunload", (e) => { if (anyDirty()) { e.preventDefa
   } catch (e) { toast("Cannot reach SV Studio backend: " + e.message, "err"); }
   setInterval(() => api("/api/ping").catch(() => status("Backend not running — restart SV Studio")), 20000);
   // closing the window shuts SV Studio down (a reload pings again straight away, which cancels this)
-  window.addEventListener("pagehide", () => { try { navigator.sendBeacon("/api/bye?token=" + window.SVS_TOKEN); } catch (e) {} });
+  let byeSent = false;
+  const bye = () => { if (byeSent) return; byeSent = true; try { navigator.sendBeacon("/api/bye?token=" + window.SVS_TOKEN); } catch (e) {} };
+  window.addEventListener("beforeunload", bye);
+  window.addEventListener("pagehide", bye);
+  window.addEventListener("pageshow", () => { byeSent = false; });
+  try { new EventSource("/api/alive?token=" + window.SVS_TOKEN); } catch (e) {}
 })();
