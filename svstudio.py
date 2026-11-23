@@ -914,11 +914,12 @@ def bundled_icarus_bin():
         return _bundled_cache["bin"]
     src = BUNDLED_ICARUS
     if " " in str(src):
-        for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramData"),
-                     os.environ.get("SystemDrive", "C:") + "\\svstudio_tools"):
-            if not base or " " in base:
+        # Not under AppData: the Microsoft Store build of Python silently redirects writes there to
+        # a private folder that other programs (cmd.exe, which Icarus uses internally) can't see.
+        for base in (Path.home() / ".svstudio", Path(os.environ.get("SystemDrive", "C:") + "\\svstudio_tools")):
+            if " " in str(base):
                 continue
-            dest = Path(base) / "SVStudio" / "iverilog-13"
+            dest = base / "iverilog-13"
             try:
                 if not (dest / "bin" / "iverilog.exe").exists() or \
                         (dest / "bin" / "iverilog.exe").stat().st_size != (src / "bin" / "iverilog.exe").stat().st_size:
