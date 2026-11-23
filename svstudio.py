@@ -2380,10 +2380,17 @@ def apply_update(log=print):
         tmp.write_bytes(content)
         try:
             os.replace(tmp, dest)
-        except OSError as e:   # e.g. a bundled .exe that is running right now
-            tmp.unlink(missing_ok=True)
-            log(f"Couldn't replace {rel}: {e}")
-            continue
+        except OSError as e:
+            try:   # a running .exe (e.g. SVStudio.exe) can't be overwritten on Windows, but it can be renamed
+                old = dest.with_name(dest.name + ".old")
+                if old.exists():
+                    old.unlink()
+                os.replace(dest, old)
+                os.replace(tmp, dest)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                log(f"Couldn't replace {rel}: {e}")
+                continue
         changed += 1
     (APP_DIR / ".svs_commit").write_text(sha + "\n")
     log(f"Updated {changed} file(s) to {sha[:7]}.")
@@ -2441,6 +2448,11 @@ def update_worker(job):
 
 def startup_update():
     """With auto_update = "auto", install a pending update before the app starts (then re-launch)."""
+    for old in APP_DIR.glob("*.old"):   # leftovers from replacing a running .exe
+        try:
+            old.unlink()
+        except OSError:
+            pass
     if CONFIG.get("auto_update", "auto") != "auto" or os.environ.get("SVS_NO_UPDATE"):
         return False
     try:

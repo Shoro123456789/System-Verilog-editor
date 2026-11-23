@@ -9,3 +9,4 @@ obj_dir/
 *.wlf
 transcript
 vendor/lib_*
+*.old
