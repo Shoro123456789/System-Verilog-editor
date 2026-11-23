@@ -20,7 +20,10 @@ jobs:
         shell: bash
         run: |
           pip install pyinstaller==6.11.1
-          pyinstaller --noconfirm --onefile --windowed --name SVStudio --icon launcher/svstudio.ico launcher/launcher.py
+          # python3.dll: needed by "abi3" extension modules such as slang (pyslang.pyd)
+          PYDIR=$(python -c "import sys, os; print(os.path.dirname(sys.executable))")
+          pyinstaller --noconfirm --onefile --windowed --name SVStudio --icon launcher/svstudio.ico \
+            --add-binary "$PYDIR/python3.dll;." launcher/launcher.py
           cp dist/SVStudio.exe SVStudio.exe
       - name: Smoke test (start, serve the UI, stop)
         shell: pwsh
@@ -35,6 +38,20 @@ jobs:
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) { Get-Content "$env:USERPROFILE\.svstudio.log" -ErrorAction SilentlyContinue; throw "SVStudio.exe did not start" }
           Write-Host "SVStudio.exe served the UI"
+          # live check (slang) must load inside the exe
+          $p = Start-Process -FilePath .\SVStudio.exe -ArgumentList "examples","--no-window","--port","8798" -PassThru
+          Start-Sleep -Seconds 6
+          $html = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8798/).Content
+          $tok = [regex]::Match($html, 'SVS_TOKEN = "([0-9a-f]+)"').Groups[1].Value
+          $st = ""
+          for ($i = 0; $i -lt 10; $i++) {
+            $st = (Invoke-WebRequest -UseBasicParsing -Method POST -Headers @{"X-SVS-Token"=$tok} -ContentType "application/json" -Body "{}" http://127.0.0.1:8798/api/lint).Content
+            if ($st -match '"state": "(ok|off)"') { break }
+            Start-Sleep -Seconds 2
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Write-Host $st.Substring(0, [Math]::Min(300, $st.Length))
+          if ($st -notmatch '"state": "ok"') { throw "Live check (slang) doesn't load inside SVStudio.exe" }
           Get-Content "$env:USERPROFILE\.svstudio.log" -ErrorAction SilentlyContinue
       - name: Commit SVStudio.exe
         shell: bash
