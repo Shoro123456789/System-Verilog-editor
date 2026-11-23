@@ -144,6 +144,15 @@ The **Timing** tab shows whether a design meets timing on the lab board's Sparta
   or from SV Studio's built-in copy of the board pinout. These approximate the lab's timing
   constraints, which aren't public, so the numbers can differ slightly from a lab build.
 
+## Updates
+
+SV Studio updates itself from this GitHub repo. By default, when it starts it checks for a newer
+version and installs it before opening. If an update appears while it's running, a bar offers
+**Update & restart**, and you can also run *Check for updates* from the command palette (F1).
+**Settings → Updates** switches between installing automatically, asking first, and never checking.
+Updating replaces the app's files with the latest `main`, so local edits to SV Studio's own files are
+overwritten. A git checkout is updated with `git pull --ff-only` instead.
+
 ## Settings (⚙)
 
 - **Questa bin folder:** set this if Questa isn't auto-detected, e.g. `C:\altera_lite\25.1std\questa_fse\win64` or `C:\intelFPGA_lite\23.1std\questa_fse\win64`.
