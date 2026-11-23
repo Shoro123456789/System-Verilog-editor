@@ -1036,13 +1036,15 @@ def icarus_build(job, proj, top, runtime, compile_only=False):
         files = [conv(prims)] + files
     incs = ["-I" + conv(_rel(d, str(root))) for d in _incdirs(proj)]
     if top and compile_only:
-        vcd_rel, extra = None, ["-s", top]
+        vcd_rel, opts, extra = None, ["-s", top], []
     elif top:
         wp, vcd_rel = _write_wrapper(proj, top, build, _runtime_literal(runtime))
-        extra = ["-s", WRAPPER_TOP, conv(_rel(str(wp), str(root)))]
+        opts, extra = ["-s", WRAPPER_TOP], [conv(_rel(str(wp), str(root)))]
     else:
-        vcd_rel, extra = None, []
-    cmd = pre + _bundled_icarus_args(pre, "iverilog") + ["-g2012", "-o", f"{BUILD_DIR}/sim.vvp"] + incs + _split(CONFIG.get("iverilog_flags")) + files + extra
+        vcd_rel, opts, extra = None, [], []
+    # all options before the source files: the Windows build of iverilog stops reading options at the first file
+    cmd = pre + _bundled_icarus_args(pre, "iverilog") + ["-g2012", "-o", f"{BUILD_DIR}/sim.vvp"] + opts + incs + \
+        _split(CONFIG.get("iverilog_flags")) + files + extra
     return run_cmd(job, cmd, str(root)) == 0, vcd_rel
 
 
