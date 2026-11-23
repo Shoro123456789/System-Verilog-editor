@@ -1,0 +1,55 @@
+name: build-icarus-linux
+# Builds the Icarus Verilog bundled for Linux (tools/iverilog-linux) on Ubuntu 22.04, so it runs on
+# 22.04 and newer (and other distros with glibc 2.35+), tests it, and commits it.
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build-icarus-linux.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Icarus Verilog 13.0
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gperf bison flex autoconf
+          git clone -q --depth 1 --branch v13_0 https://github.com/steveicarus/iverilog /tmp/iv
+          cd /tmp/iv && sh autoconf.sh
+          ./configure --prefix=/opt/svs-iverilog LDFLAGS="-static-libgcc -static-libstdc++" >/dev/null
+          make -j4 >/dev/null
+          make install DESTDIR=/tmp/out >/dev/null
+          D=/tmp/out/opt/svs-iverilog
+          rm -rf "$D/include" "$D/share" "$D/lib/libvpi.a" "$D/bin/iverilog-vpi"
+          rm -f $D/lib/ivl/{blif,pcb,sizer,stub,vhdl,vlog95}{.tgt,.conf,-s.conf} $D/lib/ivl/vhdlpp
+          strip $D/bin/* $D/lib/ivl/ivl $D/lib/ivl/ivlpp $D/lib/ivl/*.tgt $D/lib/ivl/*.vpi || true
+          rm -rf "$GITHUB_WORKSPACE/tools/iverilog-linux"
+          mkdir -p "$GITHUB_WORKSPACE/tools/iverilog-linux"
+          cp -r $D/bin $D/lib "$GITHUB_WORKSPACE/tools/iverilog-linux/"
+          cp COPYING "$GITHUB_WORKSPACE/tools/iverilog-linux/"
+          cd "$GITHUB_WORKSPACE/tools/iverilog-linux"
+          printf '%s\n' "Icarus Verilog 13.0 for Linux x86-64, bundled with SV Studio so Linux users can simulate" \
+            "without installing anything (useful where you can't use sudo/apt)." "" \
+            "Built from the unmodified upstream source, tag v13_0: https://github.com/steveicarus/iverilog/tree/v13_0" \
+            "on Ubuntu 22.04 (glibc 2.35) with a static C++ runtime, by .github/workflows/build-icarus-linux.yml." "" \
+            "Icarus Verilog is Copyright (c) Stephen Williams and contributors, licensed under the GNU General" \
+            "Public License version 2 or later (see COPYING). The source code is available at the link above." > README.txt
+          du -sh . ; ldd bin/iverilog bin/vvp lib/ivl/ivl
+      - name: Test from a different folder (as SV Studio uses it, with -B / -M)
+        run: |
+          cp -r tools/iverilog-linux /tmp/moved
+          cd /tmp && printf 'module t; logic [3:0] x = 4%sd9; initial begin $display("icarus ok %%0d", x); $finish; end endmodule\n' "'" > t.sv
+          /tmp/moved/bin/iverilog -B /tmp/moved/lib/ivl -g2012 -o t.vvp t.sv
+          /tmp/moved/bin/vvp -M /tmp/moved/lib/ivl -n t.vvp | tee out.txt
+          grep -q "icarus ok 9" out.txt
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A tools/iverilog-linux
+          git diff --cached --quiet && exit 0
+          git commit -m "Build bundled Icarus Verilog for Linux [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main

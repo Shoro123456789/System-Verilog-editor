@@ -316,7 +316,7 @@ def _tool_label(name):
     if p:
         return p
     if name == "iverilog" and CONFIG.get("use_bundled_icarus", True) and bundled_icarus_bin():
-        return "built-in: " + str(Path(bundled_icarus_bin()) / "iverilog.exe")
+        return "built-in: " + str(Path(bundled_icarus_bin()) / ("iverilog.exe" if IS_WIN else "iverilog"))
     w = wsl_tool(name)
     return f"WSL: {w}" if w else None
 
@@ -907,15 +907,22 @@ def questa_sim(job, proj, top, runtime):
 
 
 # ---- Verilator / Icarus (native, bundled, or through WSL on Windows)
-BUNDLED_ICARUS = APP_DIR / "tools" / "iverilog-win"
+BUNDLED_ICARUS = APP_DIR / "tools" / ("iverilog-win" if IS_WIN else "iverilog-linux")
 _bundled_cache = {}
 
 
+def _bundled_supported():
+    if IS_WIN:
+        return True
+    return sys.platform.startswith("linux") and platform.machine().lower() in ("x86_64", "amd64")
+
+
 def bundled_icarus_bin():
-    """bin folder of the Icarus Verilog build shipped with SV Studio (Windows only), or None.
-    Icarus passes its own path to sub-commands, so if SV Studio lives in a folder with spaces the
-    bundle is copied once to a space-free folder."""
-    if not IS_WIN or not (BUNDLED_ICARUS / "bin" / "iverilog.exe").exists():
+    """bin folder of the Icarus Verilog build shipped with SV Studio (Windows, Linux x86-64), or None.
+    Icarus passes its own path to sub-commands through the shell, so if SV Studio lives in a folder with
+    spaces the bundle is copied once to a space-free folder."""
+    exe = "iverilog.exe" if IS_WIN else "iverilog"
+    if not _bundled_supported() or not (BUNDLED_ICARUS / "bin" / exe).exists():
         return None
     if "bin" in _bundled_cache:
         return _bundled_cache["bin"]
@@ -923,19 +930,27 @@ def bundled_icarus_bin():
     if " " in str(src):
         # Not under AppData: the Microsoft Store build of Python silently redirects writes there to
         # a private folder that other programs (cmd.exe, which Icarus uses internally) can't see.
-        for base in (Path.home() / ".svstudio", Path(os.environ.get("SystemDrive", "C:") + "\\svstudio_tools")):
+        name = "iverilog-13" if IS_WIN else "iverilog-13-linux"
+        for base in (Path.home() / ".svstudio", Path(os.environ.get("SystemDrive", "C:") + "\\svstudio_tools") if IS_WIN else Path("/tmp/svstudio_tools")):
             if " " in str(base):
                 continue
-            dest = base / "iverilog-13"
+            dest = base / name
             try:
-                if not (dest / "bin" / "iverilog.exe").exists() or \
-                        (dest / "bin" / "iverilog.exe").stat().st_size != (src / "bin" / "iverilog.exe").stat().st_size:
+                if not (dest / "bin" / exe).exists() or \
+                        (dest / "bin" / exe).stat().st_size != (src / "bin" / exe).stat().st_size:
                     shutil.rmtree(dest, ignore_errors=True)
                     shutil.copytree(src, dest)
                 src = dest
                 break
             except OSError:
                 continue
+    if not IS_WIN:   # files written by the updater (or some unzip tools) may have lost the execute bit
+        for f in list((src / "bin").iterdir()) + [src / "lib" / "ivl" / "ivl", src / "lib" / "ivl" / "ivlpp"]:
+            try:
+                if f.exists() and not os.access(f, os.X_OK):
+                    f.chmod(0o755)
+            except OSError:
+                pass
     _bundled_cache["bin"] = str(src / "bin")
     return _bundled_cache["bin"]
 
@@ -956,7 +971,7 @@ def _tool(name, root):
     if p:
         return [p], (lambda x: x), False
     if name in ("iverilog", "vvp") and CONFIG.get("use_bundled_icarus", True) and bundled_icarus_bin():
-        return [str(Path(bundled_icarus_bin()) / f"{name}.exe")], (lambda x: x), False
+        return [str(Path(bundled_icarus_bin()) / (name + (".exe" if IS_WIN else "")))], (lambda x: x), False
     if IS_WIN and wsl_tool(name):
         return [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(root), "-e", name], to_wsl_path, True
     return None, None, False
@@ -2378,6 +2393,12 @@ def apply_update(log=print):
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".svs_new")
         tmp.write_bytes(content)
+        mode = (z.getinfo(n).external_attr >> 16) & 0o777
+        if not IS_WIN and mode & 0o111:
+            try:
+                tmp.chmod(mode | 0o644)
+            except OSError:
+                pass
         try:
             os.replace(tmp, dest)
         except OSError as e:
