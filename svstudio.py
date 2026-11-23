@@ -932,6 +932,16 @@ def bundled_icarus_bin():
     return _bundled_cache["bin"]
 
 
+def _bundled_icarus_args(pre, name):
+    """Point the built-in Icarus at its own lib/ivl folder explicitly (-B for iverilog, -M for vvp)
+    instead of relying on it finding itself from the .exe location."""
+    b = bundled_icarus_bin()
+    if not pre or not b or Path(pre[0]).parent != Path(b):
+        return []
+    lib = str(Path(b).parent / "lib" / "ivl")
+    return ["-B", lib] if name == "iverilog" else ["-M", lib]
+
+
 def _tool(name, root):
     """argv prefix for running `name` with cwd=root, plus a path converter for its arguments."""
     p = shutil.which(name)
@@ -1031,7 +1041,7 @@ def icarus_build(job, proj, top, runtime, compile_only=False):
         extra = ["-s", WRAPPER_TOP, conv(_rel(str(wp), str(root)))]
     else:
         vcd_rel, extra = None, []
-    cmd = pre + ["-g2012", "-o", f"{BUILD_DIR}/sim.vvp"] + incs + _split(CONFIG.get("iverilog_flags")) + files + extra
+    cmd = pre + _bundled_icarus_args(pre, "iverilog") + ["-g2012", "-o", f"{BUILD_DIR}/sim.vvp"] + incs + _split(CONFIG.get("iverilog_flags")) + files + extra
     return run_cmd(job, cmd, str(root)) == 0, vcd_rel
 
 
@@ -1041,7 +1051,7 @@ def icarus_sim(job, proj, top, runtime):
         return 1, None
     root = Path(proj["root"])
     pre, _, _ = _tool("vvp", str(root))
-    rc = run_cmd(job, (pre or ["vvp"]) + ["-n", f"{BUILD_DIR}/sim.vvp"], str(root))
+    rc = run_cmd(job, (pre or ["vvp"]) + _bundled_icarus_args(pre, "vvp") + ["-n", f"{BUILD_DIR}/sim.vvp"], str(root))
     return rc, root / vcd_rel
 
 
