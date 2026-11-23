@@ -408,6 +408,73 @@ def parse_mpf(mpf):
     return out
 
 
+def _search_dirs(root):
+    """Folders to look in for modules the project uses but doesn't list: the project folder, then its
+    parents up to the repository root (a folder with .git), at most 3 levels, never the home folder."""
+    dirs, d = [Path(root)], Path(root)
+    home = Path.home().resolve()
+    for _ in range(3):
+        if (d / ".git").exists() or d.parent == d:
+            break
+        d = d.parent
+        if d == home or d.parent == d or d == home.parent:
+            break
+        dirs.append(d)
+    return dirs
+
+
+def find_missing_modules(root, files, modules):
+    """Questa projects often list only one exercise's files and get the rest (e.g. the lab's BoardLib
+    and Display_Decoder) from pre-compiled libraries. Find the source files that define modules the
+    design instantiates but the project doesn't contain, so compiling, live checking and the Board tab
+    work without editing the project."""
+    defined = {m["name"] for m in modules}
+    have = {os.path.normcase(f["path"]) for f in files}
+    missing = {d for m in modules for d in m.get("unknown", [])} - defined - set(PRIMS)
+    if not missing:
+        return []
+    index = {}                     # module name -> candidate files, nearest first
+    seen = 0
+    for base in _search_dirs(root):
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+            for fn in sorted(filenames):
+                if Path(fn).suffix.lower() not in (".sv", ".v"):
+                    continue
+                path = str(Path(dirpath, fn).resolve())
+                if os.path.normcase(path) in have:
+                    continue
+                seen += 1
+                try:
+                    t = _strip_comments(Path(path).read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+                for m in MOD_DECL.finditer(t):
+                    index.setdefault(m.group(1), [])
+                    if path not in index[m.group(1)]:
+                        index[m.group(1)].append(path)
+                if seen > 3000:
+                    break
+            if seen > 3000:
+                break
+    out, added = [], set()
+    for _ in range(6):            # newly found files may use further missing modules
+        new = []
+        for name in sorted(missing):
+            paths = index.get(name)
+            if paths and paths[0] not in added:
+                added.add(paths[0])
+                new.append({"path": paths[0], "exists": True, "auto": True,
+                            "kind": HDL_KINDS.get(Path(paths[0]).suffix.lower(), "other")})
+        if not new:
+            break
+        out += new
+        mods, _, _ = analyse_modules(files + out)
+        defined = {m["name"] for m in mods}
+        missing = {d for m in mods for d in m.get("unknown", [])} - defined - set(PRIMS)
+    return out
+
+
 def scan_folder(root):
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -508,6 +575,7 @@ def analyse_modules(files):
         used = {mm.group(1) for mm in INST_RE.finditer(info.pop("_body"))}
         info["deps"] = sorted(u for u in used if u in modules and u != name)
         info["prims"] = sorted(u for u in used if u in PRIMS and u not in modules)
+        info["unknown"] = sorted(u for u in used if u not in modules and u not in PRIMS and u != name)
     instantiated = {d for m in modules.values() for d in m["deps"]}
     for name, info in modules.items():
         info["instantiated"] = name in instantiated
@@ -624,6 +692,17 @@ def load_project(path):
             d = f["rel"].rsplit("/", 1)[0] if "/" in f["rel"] else ""
             f["group"] = d if not d.startswith("..") else str(Path(f["path"]).parent).replace("\\", "/")
     modules, tops, dumpfile = analyse_modules(files)
+    found = find_missing_modules(root, files, modules)
+    if found:
+        for f in found:
+            f["kind"] = HDL_KINDS.get(Path(f["path"]).suffix.lower(), "other")
+            try:
+                f["rel"] = os.path.relpath(f["path"], root).replace("\\", "/")
+            except ValueError:
+                f["rel"] = f["path"]
+            f["group"] = "Found automatically"
+        files = files + found
+        modules, tops, dumpfile = analyse_modules(files)
     proj = {
         "name": (mpf.stem if mpf else root.name),
         "root": str(root),
@@ -1186,10 +1265,37 @@ def board_build(job, proj, top):
                  "--top-module", BOARD_TOP, "-Mdir", mdir, "-o", "Vboard"] + incs + files + [main_cpp]
     if not verilate_and_make(job, cmd, mdir, "V" + BOARD_TOP, str(root), via_wsl):
         return None
+    rd = run_dir(proj)
+    if rd != str(root):
+        job.log(f"Running from {rd} so the design's memory files ($readmemh) are found.", "info")
     if via_wsl:
-        return [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(str(root)), "-e", f"{mdir}/Vboard"]
+        return [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(rd), "-e", f"{mdir}/Vboard"]
     exe = Path(mdir) / ("Vboard.exe" if IS_WIN else "Vboard")
     return [str(exe)]
+
+
+def run_dir(proj):
+    """Folder to run a simulation from so relative $readmemh/$readmemb paths resolve. Lab files use
+    paths relative to the repository root (e.g. "./src/Ex3/MU0_test.mem"), so if the project was
+    opened from a subfolder, use the ancestor where those files exist."""
+    root = Path(proj["root"])
+    paths = set()
+    for f in proj["files"]:
+        if f["exists"] and f["kind"] in ("sv", "v"):
+            try:
+                t = Path(f["path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            # skip `ifdef SYNTHESIS sections (paths for Vivado, not for simulation)
+            t = re.sub(r"`ifdef\s+SYNTHESIS\b.*?(`else|`endif)", "", t, flags=re.S)
+            paths.update(re.findall(r'\$readmem[hb]\s*\(\s*"([^"]+)"', t))
+    rel = [p for p in paths if not os.path.isabs(p)]
+    if not rel or all((root / p).exists() for p in rel):
+        return str(root)
+    for d in _search_dirs(root)[1:]:
+        if all((d / p).exists() for p in rel):
+            return str(d)
+    return str(root)
 
 
 class BoardSession:
@@ -1205,7 +1311,7 @@ class BoardSession:
 
     def start(self, argv):
         kw = {"creationflags": 0x08000000} if IS_WIN else {"start_new_session": True}
-        self.proc = subprocess.Popen(argv, cwd=self.proj["root"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen(argv, cwd=run_dir(self.proj), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                      bufsize=1, env=_env(), **kw)
         self.alive = True
