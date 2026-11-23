@@ -338,7 +338,10 @@ document.addEventListener("keyup", (e) => {
 /* ---------------------------------------------------------------- hooks */
 buildBoard();
 const _renderProject = renderProject;
-renderProject = function () { _renderProject(); renderBoardTops(); refreshMemFiles(); };   // eslint-disable-line no-global-assign
+renderProject = function () {
+  _renderProject();
+  if (S.project !== BD.proj) { BD.proj = S.project; renderBoardTops(); refreshMemFiles(); }
+};   // eslint-disable-line no-global-assign
 if (S.project) { renderBoardTops(); refreshMemFiles(); }
 COMMANDS.push(["Start virtual lab board", "", () => { showTab("board"); startBoard(); }, "▦"]);
 COMMANDS.push(["Show Board", "", () => showTab("board"), "▦"]);

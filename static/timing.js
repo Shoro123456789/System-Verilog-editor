@@ -193,7 +193,10 @@ window.onTimingDone = async (ok) => {
 $("#tmRun").onclick = runTiming;
 $("#tmReload").onclick = loadTiming;
 const _renderProject2 = renderProject;
-renderProject = function () { _renderProject2(); renderTimingTops(); loadTiming(); };   // eslint-disable-line no-global-assign
+renderProject = function () {
+  _renderProject2();
+  if (S.project !== TM.proj) { TM.proj = S.project; renderTimingTops(); loadTiming(); }
+};   // eslint-disable-line no-global-assign
 if (S.project) { renderTimingTops(); loadTiming(); }
 COMMANDS.push(["Run FPGA timing analysis (Vivado)", "", () => runTiming(), "⏱"]);
 COMMANDS.push(["Show Timing", "", () => showTab("timing"), "⏱"]);

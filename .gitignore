@@ -8,3 +8,4 @@ obj_dir/
 *.vcd
 *.wlf
 transcript
+vendor/lib_*

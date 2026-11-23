@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "vsim_flags": "",
     "verilator_flags": "",
     "iverilog_flags": "",
+    "use_bundled_icarus": True,  # Windows: use the Icarus Verilog that ships with SV Studio
     "vivado_path": "",          # vivado / vivado.bat (auto-detected if empty)
     "compile_before_sim": True,
     "recent": [],
@@ -307,6 +308,8 @@ def _tool_label(name):
     p = shutil.which(name)
     if p:
         return p
+    if name == "iverilog" and CONFIG.get("use_bundled_icarus", True) and bundled_icarus_bin():
+        return "built-in: " + str(Path(bundled_icarus_bin()) / "iverilog.exe")
     w = wsl_tool(name)
     return f"WSL: {w}" if w else None
 
@@ -896,12 +899,46 @@ def questa_sim(job, proj, top, runtime):
     return rc, root / vcd_rel
 
 
-# ---- Verilator / Icarus (native, or through WSL on Windows)
+# ---- Verilator / Icarus (native, bundled, or through WSL on Windows)
+BUNDLED_ICARUS = APP_DIR / "tools" / "iverilog-win"
+_bundled_cache = {}
+
+
+def bundled_icarus_bin():
+    """bin folder of the Icarus Verilog build shipped with SV Studio (Windows only), or None.
+    Icarus passes its own path to sub-commands, so if SV Studio lives in a folder with spaces the
+    bundle is copied once to a space-free folder."""
+    if not IS_WIN or not (BUNDLED_ICARUS / "bin" / "iverilog.exe").exists():
+        return None
+    if "bin" in _bundled_cache:
+        return _bundled_cache["bin"]
+    src = BUNDLED_ICARUS
+    if " " in str(src):
+        for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramData"),
+                     os.environ.get("SystemDrive", "C:") + "\\svstudio_tools"):
+            if not base or " " in base:
+                continue
+            dest = Path(base) / "SVStudio" / "iverilog-13"
+            try:
+                if not (dest / "bin" / "iverilog.exe").exists() or \
+                        (dest / "bin" / "iverilog.exe").stat().st_size != (src / "bin" / "iverilog.exe").stat().st_size:
+                    shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(src, dest)
+                src = dest
+                break
+            except OSError:
+                continue
+    _bundled_cache["bin"] = str(src / "bin")
+    return _bundled_cache["bin"]
+
+
 def _tool(name, root):
     """argv prefix for running `name` with cwd=root, plus a path converter for its arguments."""
     p = shutil.which(name)
     if p:
         return [p], (lambda x: x), False
+    if name in ("iverilog", "vvp") and CONFIG.get("use_bundled_icarus", True) and bundled_icarus_bin():
+        return [str(Path(bundled_icarus_bin()) / f"{name}.exe")], (lambda x: x), False
     if IS_WIN and wsl_tool(name):
         return [shutil.which("wsl") or "wsl.exe", "--cd", to_wsl_path(root), "-e", name], to_wsl_path, True
     return None, None, False
@@ -1629,6 +1666,188 @@ def timing_worker(job, proj, top):
         job.done = True
 
 
+# --------------------------------------------------------------------------- live checking (slang)
+# slang (via its Python bindings, pyslang) parses and elaborates the whole project in a few
+# milliseconds, so the editor can show errors as you type, without running a simulator.
+VENDOR_DIR = APP_DIR / "vendor"
+LINT = {"mod": None, "state": "unknown", "msg": "", "lock": threading.Lock(), "installing": False}
+LINT_IGNORE = {"newline-eof", "empty-output-connection", "width-expand", "sign-conversion", "sign-compare",
+               "unused-def", "unused-but-set-variable", "unused-variable", "unused-net", "unused-port"}
+LINT_STUBS = """
+module ICAPE2 #(parameter DEVICE_ID = 0, parameter ICAP_WIDTH = "X32", parameter SIM_CFG_FILE_NAME = "NONE")
+  (output [31:0] O, input CLK, input CSIB, input RDWRB, input [31:0] I);
+endmodule
+module glbl; endmodule
+"""
+
+
+def _try_import_pyslang():
+    try:
+        import pyslang  # noqa
+        return pyslang
+    except Exception:
+        return None
+
+
+def _vendored_pyslang():
+    """Unpack the pyslang wheel shipped with SV Studio (Windows / Linux x86-64, Python 3.11+)."""
+    if sys.version_info < (3, 11):
+        return None
+    plat = "win_amd64" if IS_WIN else "manylinux" if sys.platform.startswith("linux") else None
+    if not plat or platform.machine().lower() not in ("amd64", "x86_64"):
+        return None
+    wheels = sorted(VENDOR_DIR.glob(f"pyslang-*{plat}*.whl"))
+    if not wheels:
+        return None
+    whl = wheels[-1]
+    for base in (VENDOR_DIR, Path.home() / ".svstudio_vendor"):
+        dest = base / ("lib_" + whl.stem)
+        try:
+            if not (dest / "pyslang").exists():
+                import zipfile
+                tmp = dest.with_name(dest.name + ".tmp")
+                shutil.rmtree(tmp, ignore_errors=True)
+                with zipfile.ZipFile(whl) as z:
+                    z.extractall(tmp)
+                shutil.rmtree(dest, ignore_errors=True)
+                tmp.rename(dest)
+            if str(dest) not in sys.path:
+                sys.path.insert(0, str(dest))
+            mod = _try_import_pyslang()
+            if mod:
+                return mod
+        except Exception:
+            continue
+    return None
+
+
+def _pip_install_pyslang():
+    LINT["installing"] = True
+    LINT["state"], LINT["msg"] = "installing", "Installing the slang checker (pip install pyslang)…"
+    try:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--disable-pip-version-check", "pyslang"],
+                           capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL,
+                           creationflags=0x08000000 if IS_WIN else 0)
+        import importlib, site
+        importlib.invalidate_caches()
+        try:
+            up = site.getusersitepackages()
+            if up not in sys.path:
+                sys.path.append(up)
+        except Exception:
+            pass
+        mod = _try_import_pyslang()
+        if mod:
+            LINT["mod"], LINT["state"], LINT["msg"] = mod, "ok", "slang " + getattr(mod, "__version__", "")
+        else:
+            LINT["state"] = "off"
+            LINT["msg"] = "Live checking unavailable: couldn't install pyslang (" + \
+                ((r.stderr or r.stdout).strip().splitlines() or ["pip failed"])[-1][:200] + ")"
+    except Exception as e:
+        LINT["state"], LINT["msg"] = "off", f"Live checking unavailable: {e}"
+    finally:
+        LINT["installing"] = False
+
+
+def lint_init():
+    with LINT["lock"]:
+        if LINT["mod"] or LINT["installing"]:
+            return
+        mod = _try_import_pyslang() or _vendored_pyslang()
+        if mod:
+            LINT["mod"], LINT["state"], LINT["msg"] = mod, "ok", "slang " + getattr(mod, "__version__", "")
+            return
+    threading.Thread(target=_pip_install_pyslang, daemon=True).start()
+
+
+def lint_project(proj, overrides):
+    """Check every HDL file in the project with slang. `overrides` maps path -> unsaved editor text.
+    Returns {path: [diag, …]} for project files, with diagnostics in lab board-library files limited
+    to errors."""
+    ps = LINT["mod"]
+    if not ps:
+        return None
+    ov = {os.path.normcase(os.path.abspath(k)): v for k, v in (overrides or {}).items()}
+    files = [f for f in proj["files"] if f["exists"] and f["kind"] in ("sv", "v")]
+    sm = ps.SourceManager()
+    for d in _incdirs(proj):
+        try:
+            sm.addUserDirectories(d)
+        except Exception:
+            pass
+    pp = ps.parsing.PreprocessorOptions()
+    pp.predefines = [f"{d['name']}={d['value']}" if d["value"] else d["name"]
+                     for d in proj.get("defines", []) if "(" not in d["name"]]
+    pp.additionalIncludePaths = _incdirs(proj)
+    co = ps.ast.CompilationOptions()
+    co.errorLimit = 10000
+    try:
+        co.defaultTimeScale = ps.TimeScale.fromString("1ns/1ps")
+    except Exception:
+        pass
+    bag = ps.Bag([pp, co])
+    comp = ps.ast.Compilation(bag)
+    known = {m["name"] for m in proj["modules"]}
+    stubs = "`timescale 1ns/1ps\n" + "".join(PRIMS[n] for n in sorted(PRIMS) if n not in known) + \
+        "".join(b + "endmodule\n" for b in re.split(r"endmodule\n", LINT_STUBS) if b.strip()
+                and re.search(r"module (\w+)", b).group(1) not in known)
+    comp.addSyntaxTree(ps.syntax.SyntaxTree.fromText(stubs, sm, "svs_stubs.v", "", bag))
+    by_path = {}
+    for f in files:
+        key = os.path.normcase(os.path.abspath(f["path"]))
+        text = ov.get(key)
+        if text is None:
+            try:
+                text = Path(f["path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        by_path[key] = f["path"]
+        try:
+            tree = ps.syntax.SyntaxTree.fromText(text, sm, Path(f["path"]).name, f["path"], bag)
+        except RuntimeError:  # already pulled in by an `include - parse it again under another name
+            alt = f["path"] + ".svs"
+            by_path[os.path.normcase(os.path.abspath(alt))] = f["path"]
+            tree = ps.syntax.SyntaxTree.fromText(text, sm, Path(f["path"]).name, alt, bag)
+        comp.addSyntaxTree(tree)
+    eng = ps.DiagnosticEngine(sm)
+    lib = _board_lib_files(proj)
+    out = {f["path"]: [] for f in files}
+    seen = set()
+    for d in comp.getAllDiagnostics():
+        loc = d.location
+        try:
+            full = sm.getFullPath(loc.buffer) if hasattr(loc, "buffer") else ""
+        except Exception:
+            full = ""
+        if not full:
+            try:
+                full = str(sm.getFileName(loc))
+            except Exception:
+                continue
+        path = by_path.get(os.path.normcase(os.path.abspath(str(full))))
+        if not path:
+            continue
+        sev = eng.getSeverity(d.code, loc)
+        sev_name = str(sev).rsplit(".", 1)[-1].lower()
+        if sev_name in ("ignored", "note"):
+            continue
+        opt = eng.getOptionName(d.code)
+        msg = eng.formatMessage(d)
+        if opt in LINT_IGNORE or "time scale" in msg:
+            continue
+        is_err = sev_name in ("error", "fatal")
+        if path in lib and not is_err:
+            continue
+        line, col = sm.getLineNumber(loc), sm.getColumnNumber(loc)
+        k = (path, line, col, msg)
+        if k in seen:
+            continue
+        seen.add(k)
+        out[path].append({"line": line, "col": col, "severity": "error" if is_err else "warning",
+                          "message": msg + (f" [{opt}]" if opt else ""), "code": opt or str(d.code)})
+    return out
+
+
 ERR_RE = re.compile(r"(\*\* Error|%Error|\berror\b|Fatal)", re.I)
 
 
@@ -1889,6 +2108,18 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS[job.id] = job
                 threading.Thread(target=timing_worker, daemon=True, args=(job, proj, top)).start()
                 return self._send(200, {"id": job.id, "project": proj})
+            if u.path == "/api/lint":
+                proj = STATE["project"]
+                if not proj:
+                    return self._send(200, {"state": "noproject", "diags": {}})
+                if not LINT["mod"]:
+                    lint_init()
+                    return self._send(200, {"state": LINT["state"], "msg": LINT["msg"], "diags": None})
+                t0 = time.time()
+                with LINT["lock"]:
+                    diags = lint_project(proj, b.get("files") or {})
+                return self._send(200, {"state": "ok", "msg": LINT["msg"], "diags": diags,
+                                        "ms": round((time.time() - t0) * 1000)})
             if u.path == "/api/board/cmd":
                 sess = BOARD["session"]
                 if not sess:
@@ -2021,6 +2252,7 @@ def main():
 
     if IS_WIN:
         threading.Thread(target=lambda: [wsl_tool(n) for n in ("verilator", "iverilog", "make")], daemon=True).start()
+    threading.Thread(target=lint_init, daemon=True).start()
 
     port = _free_port(args.port)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)

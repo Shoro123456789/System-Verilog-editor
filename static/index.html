@@ -263,6 +263,7 @@
 
 <footer class="statusbar">
   <div class="chips" id="toolChips"></div>
+  <span class="chip" id="lintChip" title="Live error checking">Live check</span>
   <div class="spacer"></div>
   <span id="statusText">Ready</span>
 </footer>
@@ -301,6 +302,7 @@
       <label>Extra Verilator flags<input data-cfg="verilator_flags"></label>
       <label>Extra iverilog flags<input data-cfg="iverilog_flags"></label>
       <label class="check"><input type="checkbox" data-cfg="compile_before_sim"> Compile before every simulation (Questa)</label>
+      <label class="check"><input type="checkbox" data-cfg="use_bundled_icarus"> Use SV Studio's built-in Icarus Verilog on Windows (no install needed)</label>
     </div>
     <div class="detected" id="detected"></div>
     <div class="dlg-actions">
@@ -324,5 +326,6 @@
 <script src="app.js"></script>
 <script src="board.js"></script>
 <script src="timing.js"></script>
+<script src="lint.js"></script>
 </body>
 </html>

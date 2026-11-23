@@ -367,7 +367,11 @@ const activeTab = () => (S.file ? findTab(S.file) : null);
 const anyDirty = () => S.tabs.some(t => t.dirty);
 
 const editor = SVEditor.create($("#cmHost"), {
-  onChange: () => { const t = activeTab(); if (t && !S.loadingDoc && !t.dirty) { t.dirty = true; renderTabs(); } },
+  onChange: () => {
+    const t = activeTab();
+    if (t && !S.loadingDoc && !t.dirty) { t.dirty = true; renderTabs(); }
+    if (!S.loadingDoc && window.onEditorChange) window.onEditorChange();
+  },
   onCursor: (ln, col) => { $("#edPos").textContent = `Ln ${ln}, Col ${col}`; },
   onGoto: ({ module }) => openFile(module.file, module.line),
   onSave: () => saveFile(),
@@ -466,6 +470,7 @@ async function saveFile(tab) {
     if (isActive) tab.state = editor.state;
     renderTabs();
     status(`Saved ${basename(tab.path)}`);
+    if (window.onEditorChange) window.onEditorChange(0);
   } catch (e) { toast("Save failed: " + e.message, "err"); }
 }
 async function saveAll() { for (const t of S.tabs.filter(x => x.dirty)) await saveFile(t); }
@@ -525,8 +530,22 @@ function addDiagnostic(path, line, col, severity, message) {
   const list = S.diags.get(key).items;
   if (!list.some(d => d.line === line && d.message === message)) list.push({ line, col, severity, message });
 }
+// compile/simulate diagnostics (S.diags) merged with live-check diagnostics (S.lint)
+function allDiagGroups() {
+  const m = new Map();
+  for (const [k, g] of S.diags) m.set(k, { path: g.path, inProject: g.inProject, items: [...g.items] });
+  for (const [k, g] of (S.lint || new Map())) {
+    if (!m.has(k)) m.set(k, { path: g.path, inProject: true, items: [] });
+    const t = m.get(k).items;
+    g.items.forEach(d => { if (!t.some(x => x.line === d.line && x.message === d.message)) t.push(d); });
+  }
+  return [...m.values()];
+}
 function applyDiagnostics() {
-  if (S.file) editor.setDiagnostics((S.diags.get(norm(S.file)) || { items: [] }).items);
+  if (S.file) {
+    const g = allDiagGroups().find(x => norm(x.path) === norm(S.file));
+    editor.setDiagnostics(g ? g.items : []);
+  }
   renderProblemsSoon();
 }
 function renderProblemsSoon() {
@@ -535,7 +554,7 @@ function renderProblemsSoon() {
 }
 function renderProblems() {
   const box = $("#problems");
-  const groups = [...S.diags.values()].filter(g => g.items.length);
+  const groups = allDiagGroups().filter(g => g.items.length);
   let nErr = 0, nWarn = 0;
   groups.forEach(g => g.items.forEach(d => d.severity === "error" ? nErr++ : nWarn++));
   const b = $("#problemsBadge");

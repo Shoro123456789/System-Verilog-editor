@@ -80,6 +80,25 @@ The app quits on its own a few minutes after you close its window. Optionally, `
 
 Your chosen signals and radixes are remembered and kept when you re-run the simulation.
 
+## Live error checking
+
+Errors are checked as you type, without compiling. SV Studio runs [slang](https://github.com/MikePopoloski/slang)
+over the whole project (including your unsaved edits) about half a second after you stop typing.
+Problems are underlined in the editor and listed under **Problems**, marked *live*. It catches syntax
+errors, undeclared signals, wrong port names on instances, width truncation and missing `case`
+defaults. The *Live check* chip in the status bar shows whether it's running.
+
+slang ships with SV Studio as a Python wheel in `vendor/` (Windows and Linux, x86-64, Python 3.11+).
+On other systems SV Studio installs it once with `pip install --user pyslang`.
+
+## Built-in Icarus Verilog (Windows)
+
+On Windows SV Studio includes Icarus Verilog 13 (`tools/iverilog-win`), so the **Icarus** simulator
+works with nothing else installed: no WSL and no separate download. An `iverilog` on your PATH is
+used instead if you have one, and the built-in copy can be switched off in Settings. Icarus is GPL
+software; see `tools/iverilog-win/README.txt` for the source and build details. Verilator (for speed
+and the Board tab) and Questa remain optional.
+
 ## Virtual lab board (COMP12111)
 
 The **Board** tab runs a design live on a virtual version of the Spartan-7 lab board. It works with
