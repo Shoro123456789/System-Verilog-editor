@@ -144,6 +144,16 @@ The **Timing** tab shows whether a design meets timing on the lab board's Sparta
   or from SV Studio's built-in copy of the board pinout. These approximate the lab's timing
   constraints, which aren't public, so the numbers can differ slightly from a lab build.
 
+## SVStudio.exe (Windows)
+
+Double-click **SVStudio.exe** to start SV Studio. It has Python built in, so nothing needs installing.
+Keep it inside the SV Studio folder: it runs the `svstudio.py` next to it, which is what lets the
+app update itself. The exe is built automatically on GitHub (`.github/workflows/build-exe.yml`). It
+isn't code-signed, so the first time you run it Windows SmartScreen may say "Windows protected your
+PC". Click *More info → Run anyway*. `SV Studio.bat` still works if you'd rather use your own Python.
+
+Closing the SV Studio window shuts it down completely; no Python process is left running.
+
 ## Updates
 
 SV Studio updates itself from this GitHub repo. By default, when it starts it checks for a newer

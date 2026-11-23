@@ -39,6 +39,12 @@ CONFIG_PATH = Path.home() / ".svstudio.json"
 BUILD_DIR = ".svstudio"           # created inside the project folder
 WRAPPER_TOP = "svs_top"
 IS_WIN = platform.system() == "Windows"
+FROZEN = bool(getattr(sys, "frozen", False))   # running inside SVStudio.exe (built-in Python)
+
+
+def self_argv():
+    """Command that starts SV Studio again (SVStudio.exe, or python + svstudio.py)."""
+    return [sys.executable] if FROZEN else [sys.executable, str(APP_DIR / "svstudio.py")]
 TOKEN = secrets.token_hex(16)
 
 HDL_KINDS = {
@@ -1736,6 +1742,9 @@ def _vendored_pyslang():
 
 
 def _pip_install_pyslang():
+    if FROZEN:   # SVStudio.exe: no pip, and the bundled wheel should already have worked
+        LINT["state"], LINT["msg"] = "off", "Live checking unavailable (couldn't load the bundled slang)"
+        return
     LINT["installing"] = True
     LINT["state"], LINT["msg"] = "installing", "Installing the slang checker (pip install pyslang)…"
     try:
@@ -1922,17 +1931,27 @@ def browse_dialog(kind, start):
         "if k == 'dir': p = filedialog.askdirectory(initialdir=s, title='Open project folder')\n"
         "elif k == 'vcd': p = filedialog.askopenfilename(initialdir=s, title='Open VCD waveform', filetypes=[('VCD', '*.vcd'), ('All', '*.*')])\n"
         "else: p = filedialog.askopenfilename(initialdir=s, title='Open Questa project', filetypes=[('Questa project', '*.mpf'), ('HDL', '*.sv *.v'), ('All', '*.*')])\n"
-        "sys.stdout.write(p or '')\n"
+        "import os\nout = os.environ.get('SVS_OUT')\n"
+        "open(out, 'w', encoding='utf-8').write(p or '') if out else sys.stdout.write(p or '')\n"
     )
     try:
         exe = sys.executable
         if IS_WIN and exe.lower().endswith("pythonw.exe") and Path(exe[:-5] + ".exe").exists():
             exe = exe[:-5] + ".exe"
         kw = {"creationflags": 0x08000000} if IS_WIN else {}
-        r = subprocess.run([exe, "-c", code], capture_output=True, text=True, timeout=600, **kw)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "dialog failed")
-        return r.stdout.strip()
+        fd, out = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            r = subprocess.run([exe, "-c", code], capture_output=True, text=True, timeout=600,
+                               env=dict(os.environ, SVS_OUT=out), **kw)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr and r.stderr.strip() else "dialog failed")
+            return Path(out).read_text(encoding="utf-8").strip()
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
     except Exception as e:
         raise RuntimeError(f"Native dialog unavailable ({e}). Paste the path instead.")
 
@@ -1965,7 +1984,7 @@ def _allowed(path, root):
 MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon"}
 
-STATE = {"project": None, "last_ping": 0.0}
+STATE = {"project": None, "last_ping": 0.0, "bye": 0.0}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2073,9 +2092,12 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "unknown endpoint"})
 
     def do_POST(self):
+        u = urlparse(self.path)
+        if u.path == "/api/bye" and self._host_ok() and parse_qs(u.query).get("token", [""])[0] == TOKEN:
+            STATE["bye"] = time.time()   # window closed (or reloading - a ping within a few seconds cancels)
+            return self._send(200, {"ok": True})
         if not self._host_ok() or not self._api_ok():
             return self._send(403, {"error": "forbidden"})
-        u = urlparse(self.path)
         try:
             b = self._body()
             if u.path == "/api/open":
@@ -2340,7 +2362,7 @@ RUN = {"args": None, "mode": None, "port": None, "httpd": None}
 def restart_app():
     """Start a fresh SV Studio process (running the updated code) and exit this one."""
     a = RUN["args"]
-    argv = [sys.executable, str(APP_DIR / "svstudio.py")]
+    argv = self_argv()
     if a and a.project:
         argv.append(a.project)
     if RUN["mode"] == "webview" or (a and a.no_window):
@@ -2469,7 +2491,7 @@ def main():
     if startup_update():   # updated on disk: run the new version instead
         env = dict(os.environ, SVS_NO_UPDATE="1")
         kw = {"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {}
-        subprocess.Popen([sys.executable, str(APP_DIR / "svstudio.py")] + sys.argv[1:], cwd=str(APP_DIR), env=env, **kw)
+        subprocess.Popen(self_argv() + sys.argv[1:], cwd=str(APP_DIR), env=env, **kw)
         return
 
     if args.project:
@@ -2496,12 +2518,17 @@ def main():
             webview.create_window(APP_NAME, url, width=1500, height=920, min_size=(1000, 640))
             webview.start()
         else:
-            # exit automatically a few minutes after the UI stops pinging (window closed)
+            # exit when the window is closed: straight away if the page said goodbye (and didn't come back,
+            # as it does on a reload), otherwise once it has stopped pinging for a minute
             while True:
-                time.sleep(2)
-                idle = STATE["last_ping"] and time.time() - STATE["last_ping"] > 180
+                time.sleep(1)
+                if args.keep_alive or args.no_window:
+                    continue
+                now = time.time()
+                closed = STATE["bye"] and now - STATE["bye"] > 4 and STATE["last_ping"] < STATE["bye"]
+                idle = STATE["last_ping"] and now - STATE["last_ping"] > 180
                 busy = any(not j.done for j in JOBS.values())
-                if idle and not busy and not args.keep_alive and not args.no_window:
+                if closed or (idle and not busy):
                     print("Window closed - exiting.")
                     break
     except KeyboardInterrupt:
