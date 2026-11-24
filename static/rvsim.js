@@ -346,6 +346,10 @@ function run(mode = "run") {
     const isCall = (d.op === 0x6f || d.op === 0x67) && d.rd === 1;
     if (mode === "over" && !isCall) { stepOnce(); return; }
     R.stopAt = mode === "over" ? { depth } : { depth: depth - 1 };
+    if (mode === "over") {
+      const tgt = d.op === 0x6f ? (R.m.pc + d.jImm) >>> 0 : null;
+      R.stopAt.note = { fn: tgt !== null ? (R.m.symbolAt(tgt) || h8(tgt)) : "a function", cyc: R.m.cycles };
+    }
     if (mode === "out" && depth === 0) { R.stopAt = null; sys("Not inside a call — step out needs a function that was entered with call/jal.", "sys"); return; }
   } else R.stopAt = null;
   R.running = true;
@@ -368,7 +372,11 @@ function tick(first) {
     if (!(first && n === 0) && R.bpAddrs.has(m.pc)) { stopMsg = `Breakpoint at ${R.m.symbolAt(m.pc) || h8(m.pc)} (line ${lineOf(m.pc) || "?"})`; break; }
     if (!m.step()) break;
     n++;
-    if (R.stopAt && m.frames.length <= R.stopAt.depth) { stopMsg = ""; break; }
+    if (R.stopAt && m.frames.length <= R.stopAt.depth) {
+      const nt = R.stopAt.note;
+      stopMsg = nt ? `Stepped over the call to ${nt.fn} (${m.cycles - nt.cyc} instructions ran). Press F11 (Step into) to follow a call instruction by instruction.` : "";
+      break;
+    }
     if ((n & 1023) === 0 && performance.now() - t0 > 14) break;
   }
   first = false;
