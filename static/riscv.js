@@ -263,6 +263,8 @@ function evalExprB(src, lookup, pc) {
     if ((m = /^[0-9][0-9_]*(?![\w])/.exec(s.slice(i)))) { i += m[0].length; return parseInt(m[0].replace(/_/g, ""), 10); }
     if ((m = /^[A-Za-z_][\w]*/.exec(s.slice(i)))) {
       i += m[0].length; const v = lookup(m[0]);
+      if (v === undefined && (B_UNSUPPORTED.includes(m[0].toLowerCase()) || B_DIRECTIVES.includes(m[0].toLowerCase())))
+        throw new AsmError(`Label not found: "${m[0]}" is a reserved word in Bennett's assembler (a directive) and can't be a label — rename it`);
       if (v === undefined) throw new AsmError(`Label not found: "${m[0]}"` + (lookup(m[0].toLowerCase()) !== undefined || lookup(m[0].toUpperCase()) !== undefined ? " (labels are case-sensitive)" : ""));
       return v;
     }
@@ -449,7 +451,12 @@ function assembleInner(source, opts, dialect) {
       const push = (kind, size, extra = {}) => { items.push({ ln, sec, off: secOff[sec], size, kind, op, args, ...extra }); secOff[sec] += size; };
       try {
         if (B) {
-          if (B_UNSUPPORTED.includes(op)) throw new AsmError(`the ${op.toUpperCase()} directive isn't supported by SV Studio's Bennett assembler`);
+          if (B_UNSUPPORTED.includes(op)) {
+            const nxt = (args[0] || "").split(/\s+/)[0].toLowerCase();
+            if (!labelNames.length && (B_MN.has(nxt) || B_DIRECTIVES.includes(nxt) || !args.length))
+              throw new AsmError(`"${op}" is a reserved word in Bennett's assembler (the ${op.toUpperCase()} directive), so it can't be used as a label — rename it (e.g. ${op}_fn)`);
+            throw new AsmError(`the ${op.toUpperCase()} directive isn't supported by SV Studio's Bennett assembler`);
+          }
           if (op[0] === "." || op[0] === "#") throw new AsmError(op[0] === "#" ? "Bennett comments start with ';', not '#'" : `"${op}" is GNU syntax — Bennett uses DEFW/DEFB/DEFS/ALIGN/ORG/EQU (no leading dot)`);
           switch (op) {
             case "equ":
