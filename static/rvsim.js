@@ -730,6 +730,14 @@ window.addEventListener("keydown", (e) => {
   f();
 }, true);
 
+// the Files/Modules sidebar is for SystemVerilog projects: hide it while the RISC-V tab is showing
+const _showTab = window.showTab;
+window.showTab = function (name) {
+  _showTab(name);
+  document.querySelector(".sidebar").classList.toggle("rv-hide", name === "riscv");
+  if (name === "riscv") requestAnimationFrame(() => ed.view.requestMeasure());
+};
+document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => window.showTab(b.dataset.tab));
 // redraw the editor when the tab becomes visible
 document.querySelector('#tabs button[data-tab="riscv"]').addEventListener("click", () => requestAnimationFrame(() => ed.view.requestMeasure()));
 
