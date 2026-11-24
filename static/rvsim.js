@@ -2,7 +2,56 @@
 (function () {
 "use strict";
 
-const EXAMPLE = `# RISC-V example: sum an array, then print it.
+const EXAMPLE_BENNETT = `; RISC-V example in Bennett (COMP15111) syntax: sum an array, then print it.
+; F7 assemble · F5 run · F11 step · F10 step over · Shift+F11 step back
+; Click left of a line number (or press F9) for a breakpoint.
+
+        li      sp, 0x2700        ; Bennett starts every register at 0, so set up the stack
+        la      a0, nums          ; a0 = address of the array
+        lw      a1, count         ; a1 = number of elements
+        call    sum               ; a0 = sum(a0, a1)
+        mv      s0, a0
+
+        la      a0, msg           ; print "sum = "
+        li      a7, 2             ; 2 = print string
+        ecall
+        mv      a0, s0            ; print the number
+        li      a7, 3             ; 3 = print integer
+        ecall
+        li      a0, 10            ; newline
+        li      a7, 0             ; 0 = print character
+        ecall
+        li      a7, 5             ; 5 = halt
+        ecall
+
+; int sum(int *a0, int a1)
+sum     li      t0, 0             ; running total
+1       beqz    a1, %f2
+        lw      t1, 0[a0]
+        add     t0, t0, t1
+        addi    a0, a0, 4
+        addi    a1, a1, -1
+        j       %b1
+2       mv      a0, t0
+        ret
+
+nums    defw    3, 14, 15, 92, 65
+count   defw    5
+msg     defb    "sum = ", 0
+`;
+const EXAMPLE = () => (R.mode === "bennett" ? EXAMPLE_BENNETT : EXAMPLE_GNU);
+const NEW_DOC = () => R.mode === "bennett" ? "; RISC-V program (Bennett syntax)\n\n        li      sp, 0x2700\n        \n        li      a7, 5         ; halt\n        ecall\n" : "        .text\nmain:\n        \n        li      a7, 10\n        ecall\n";
+// GNU syntax (.text / .word / 4(sp) / # comments) vs Bennett syntax (DEFW / 4[sp] / ; comments)
+function detectDialect(text) {
+  const t = text.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  const gnu = (t.match(/^\s*(?:[\w.$]+:\s*)?\.(?:text|data|word|half|byte|asciz|ascii|string|globl|global|section|align|space|equ|zero)\b/gm) || []).length +
+    (t.match(/-?\w*\(\s*(?:sp|fp|ra|gp|tp|zero|[ast]\d+|x\d+)\s*\)/g) || []).length + (t.match(/^\s*#/gm) || []).length;
+  const ben = (t.match(/\b(?:defw|defb|defh|defs|dcd|dcb|align|equ|org)\b/gi) || []).length +
+    (t.match(/\w*\[\s*(?:sp|fp|ra|gp|tp|zero|[ast]\d+|x\d+)\s*\]/g) || []).length + (t.match(/^\s*;/gm) || []).length + (t.match(/%[bf]\d+/g) || []).length;
+  if (gnu === ben) return null;
+  return gnu > ben ? "gnu" : "bennett";
+}
+const EXAMPLE_GNU = `# RISC-V example (GNU syntax): sum an array, then print it.
 # F7 assemble · F5 run · F11 step · F10 step over · Shift+F11 step back
 # Click left of a line number (or press F9) for a breakpoint.
 
@@ -55,7 +104,8 @@ const R = {
   dirty: false,
   asm: null,             // last assembly result
   asmText: null,         // source it was built from
-  m: new RV.Machine({ memSize: +LS.get("rv.mem", 1048576), output: (s) => conOut(s) }),
+  mode: LS.get("rv.mode", "bennett"),
+  m: null,
   running: false,
   timer: null,
   names: LS.get("rv.names", "abi"),
@@ -69,11 +119,21 @@ const R = {
   stopAt: null,          // step over / out target
   loaded: false,
 };
-el("#rvMem").value = String(R.m.memSize);
+el("#rvMem").value = String(LS.get("rv.mem", 1048576));
+el("#rvMode").value = R.mode;
+const makeMachine = () => new RV.Machine({ mode: R.mode, memSize: +el("#rvMem").value, output: (s) => conOut(s) });
+R.m = makeMachine();
+function applyMode() {
+  el("#rvMemField").hidden = R.mode === "bennett";
+  el("#rvConHint").textContent = R.mode === "bennett"
+    ? "ecall a7: 0 print char · 1 read char · 2 print string · 3 print int · 5 halt"
+    : "ecall a7: 1 int · 4 string · 11 char · 5 read int · 8 read string · 10 exit";
+}
+applyMode();
 
 /* ---------------------------------------------------------------- editor */
 const ed = SVEditor.createAsm(el("#rvEditor"), {
-  doc: LS.get("rv.draft", null) ?? EXAMPLE,
+  doc: LS.get("rv.draft", null) ?? EXAMPLE(),
   onChange: () => {
     if (!R.dirty) { R.dirty = true; renderFile(); }
     clearTimeout(R.draftT); R.draftT = setTimeout(() => LS.set("rv.draft", ed.getDoc()), 400);
@@ -83,6 +143,7 @@ const ed = SVEditor.createAsm(el("#rvEditor"), {
   onSave: () => save(),
   onBreakpoints: () => { syncBreakpoints(); LS.set("rv.bps", ed.breakpoints()); },
   hooks: {
+    dialect: () => R.mode,
     regValue: (r) => R.loaded ? `${h8(R.m.x[r])}  =  ${R.m.x[r]}` : null,
     symbol: (name) => {
       const a = (R.asm && R.asm.symbols.get(name));
@@ -93,7 +154,7 @@ const ed = SVEditor.createAsm(el("#rvEditor"), {
 ed.setBreakpoints(LS.get("rv.bps", []));
 
 function liveCheck() {
-  const r = RV.assemble(ed.getDoc());
+  const r = RV.assemble(ed.getDoc(), { dialect: R.mode });
   ed.setDiagnostics([...r.errors, ...r.warnings]);
 }
 setTimeout(liveCheck, 300);
@@ -143,6 +204,8 @@ async function openFile(path) {
   if (/\.(s|asm)$/i.test(path)) {
     stop();
     ed.setDoc(r.text); ed.setBreakpoints([]);
+    const d = detectDialect(r.text);
+    if (d && d !== R.mode) { setMode(d, true); toast(`Switched to ${d === "bennett" ? "Bennett (COMP15111)" : "GNU / generic"} syntax for this file`, ""); }
     R.path = r.path; LS.set("rv.path", R.path); LS.set("rv.draft", r.text); R.dirty = false; renderFile();
     R.asm = null; R.loaded = false; setStatus("Not assembled", "");
     liveCheck(); assemble();
@@ -162,39 +225,55 @@ async function openFile(path) {
     if (at % 4) toast("Address should be a multiple of 4 for RISC-V", "err");
   }
   stop();
+  R.m = makeMachine();
   try { R.m.loadBinary(bytes, at); } catch (e) { toast(e.message, "err"); return; }
   R.asm = null; R.loaded = true; R.bpAddrs.clear();
+  if (/\.kmd$/i.test(path) && R.kmdSyms && R.kmdSyms.size) { R.m.program = { symbols: R.kmdSyms, symLine: new Map([...R.kmdSyms.keys()].map(k => [k, 0])) }; }
   sys(`Loaded ${path.replace(/\\/g, "/").split("/").pop()} — ${bytes.length} bytes at ${h8(at)}. No source: use the Code tab to follow execution.`, "ok");
   setStatus("Loaded image", "ok");
   R.pane = "code"; showPane("code");
   refresh(true);
 }
 
-// Bennett/Komodo .kmd listing: lines like "00000000: 00500093  ; addi x1, x0, 5"
+// Bennett .kmd listing (riscasm -lk): "00000000: 00500513    ; source" lines, then a symbol table
 function parseKMD(text) {
-  const words = new Map(); let first = null;
+  const bytesAt = new Map(); const syms = new Map();
   for (const line of text.split(/\r?\n/)) {
-    const m = /^\s*([0-9a-f]{1,8})\s*:\s*((?:[0-9a-f]{2,8}\s+)*[0-9a-f]{2,8})/i.exec(line);
-    if (!m) continue;
+    let m = /^\s*:\s*([A-Za-z_]\w*)\s+([0-9a-f]{1,8})\b/i.exec(line);
+    if (m) { syms.set(m[1], parseInt(m[2], 16)); continue; }
+    m = /^\s*(?:0x)?([0-9a-f]{1,8})\s*:\s*((?:[0-9a-f]{2,8}\s+)*[0-9a-f]{2,8})?\s*(?:;|$)/i.exec(line);
+    if (!m || !m[2]) continue;
     let a = parseInt(m[1], 16);
-    if (first === null || a < first) first = first === null ? a : Math.min(first, a);
     for (const tok of m[2].trim().split(/\s+/)) {
-      const n = tok.length / 2;
-      const v = parseInt(tok, 16);
-      for (let k = 0; k < n; k++) words.set(a + k, (v >>> (8 * k)) & 0xff);
+      const n = tok.length / 2, v = parseInt(tok, 16);
+      for (let k = 0; k < n; k++) bytesAt.set(a + k, (v >>> (8 * k)) & 0xff);
       a += n;
     }
   }
-  if (!words.size) throw new Error("No code found in the .kmd file");
-  const last = Math.max(...words.keys());
-  const bytes = new Uint8Array(last - first + 1);
-  for (const [a, b] of words) bytes[a - first] = b;
-  return { bytes, addr: first };
+  if (!bytesAt.size) throw new Error("No code found in the .kmd file");
+  const last = Math.max(...bytesAt.keys());
+  const bytes = new Uint8Array(last + 1);
+  for (const [a, b] of bytesAt) bytes[a] = b;
+  R.kmdSyms = syms;
+  return { bytes, addr: 0 };
 }
+
+function setMode(mode, quiet) {
+  R.mode = mode; LS.set("rv.mode", mode); el("#rvMode").value = mode;
+  applyMode(); stop(); R.m = makeMachine(); R.asm = null; R.loaded = false;
+  liveCheck();
+  if (!quiet) { setStatus("Not assembled", ""); refresh(true); }
+}
+el("#rvMode").onchange = () => {
+  const mode = el("#rvMode").value;
+  const d = detectDialect(ed.getDoc());
+  setMode(mode);
+  if (d && d !== mode) toast(`This program looks like ${d === "bennett" ? "Bennett" : "GNU"} syntax — it may not assemble in this mode`, "");
+};
 
 el("#rvNew").onclick = () => {
   if (R.dirty && !confirm("Discard unsaved changes to " + fname() + "?")) return;
-  stop(); ed.setDoc("        .text\nmain:\n        \n        li      a7, 10\n        ecall\n"); ed.setBreakpoints([]);
+  stop(); ed.setDoc(NEW_DOC()); ed.setBreakpoints([]);
   R.path = null; LS.set("rv.path", null); R.dirty = false; renderFile(); R.asm = null; R.loaded = false; setStatus("Not assembled", ""); refresh(true);
 };
 el("#rvOpen").onclick = () => openFile();
@@ -206,7 +285,7 @@ function setStatus(t, cls) { const c = el("#rvStatus"); c.textContent = t; c.cla
 function assemble(quiet) {
   stop();
   const text = ed.getDoc();
-  const r = RV.assemble(text);
+  const r = RV.assemble(text, { dialect: R.mode });
   ed.setDiagnostics([...r.errors, ...r.warnings]);
   if (!r.ok) {
     setStatus(`${r.errors.length} error${r.errors.length > 1 ? "s" : ""}`, "fail");
@@ -216,13 +295,15 @@ function assemble(quiet) {
     R.loaded = false; refresh(true);
     return false;
   }
-  if (R.m.memSize !== +el("#rvMem").value) R.m = new RV.Machine({ memSize: +el("#rvMem").value, output: (s) => conOut(s) });
+  if (R.m.mode !== (R.mode === "bennett" ? "bennett" : "generic") || (R.mode !== "bennett" && R.m.memSize !== +el("#rvMem").value)) R.m = makeMachine();
   try { R.m.load(r); } catch (e) { setStatus("Too big", "fail"); sys(e.message, "err"); return false; }
   R.asm = r; R.asmText = text; R.loaded = true;
   R.prevRegs = new Int32Array(R.m.x);
   syncBreakpoints();
   const words = (r.textRange[1] - r.textRange[0]) / 4, data = r.dataRange[1] - r.dataRange[0];
-  if (!quiet) sys(`Assembled ${fname()}: ${words} instruction word${words === 1 ? "" : "s"} at ${h8(r.textRange[0])}` +
+  if (!quiet && r.dialect === "bennett") sys(`Assembled ${fname()}: ${r.textRange[1] - r.textRange[0]} bytes (code and data) from ${h8(r.textRange[0])} · Bennett mode: execution starts at 0x00000000, all registers start at 0` +
+    (r.warnings.length ? ` · ${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}` : ""), "ok");
+  else if (!quiet) sys(`Assembled ${fname()}: ${words} instruction word${words === 1 ? "" : "s"} at ${h8(r.textRange[0])}` +
     (data ? `, ${data} bytes of data at ${h8(r.dataRange[0])}` : "") + `, entry ${R.m.symbolAt(r.entry) || h8(r.entry)}` +
     (r.warnings.length ? ` · ${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}` : ""), "ok");
   setStatus("Ready", "ok");
@@ -361,7 +442,7 @@ el("#rvMem").onchange = () => { LS.set("rv.mem", +el("#rvMem").value); if (R.asm
 
 /* ---------------------------------------------------------------- input (read syscalls) */
 function askInput() {
-  const kind = { 5: "Enter an integer", 8: "Enter a string", 12: "Enter a character", 63: "Enter text" }[R.m.pendingInput] || "Input";
+  const kind = { int: "Enter an integer", line: "Enter text", char: "Type characters (Enter sends a newline too)" }[R.m.pendingInput] || "Input";
   el("#rvInputLabel").textContent = kind + " ›";
   el("#rvInputForm").hidden = false;
   setStatus("Waiting for input", "running");
@@ -372,7 +453,7 @@ el("#rvInputForm").onsubmit = (e) => {
   const v = el("#rvInput").value;
   conOut(v + "\n", "sys");
   el("#rvInputForm").hidden = true;
-  R.m.provideInput(v);
+  R.m.provideInput(v + "\n");
   run();
 };
 
@@ -656,7 +737,7 @@ if (typeof COMMANDS !== "undefined") {
   COMMANDS.push(["RISC-V: Assemble", "F7", () => { showTab("riscv"); assemble(); }, "⟨⟩"]);
   COMMANDS.push(["RISC-V: Run", "F5", () => { showTab("riscv"); run(); }, "▶"]);
   COMMANDS.push(["RISC-V: Open program…", "", () => { showTab("riscv"); openFile(); }, "📂"]);
-  COMMANDS.push(["RISC-V: Load example program", "", () => { showTab("riscv"); ed.setDoc(EXAMPLE); R.dirty = true; renderFile(); assemble(); }, "✎"]);
+  COMMANDS.push(["RISC-V: Load example program", "", () => { showTab("riscv"); ed.setDoc(EXAMPLE()); R.dirty = true; renderFile(); assemble(); }, "✎"]);
 }
 window.addEventListener("beforeunload", (e) => { if (R.dirty && R.path) { e.preventDefault(); e.returnValue = ""; } });
 

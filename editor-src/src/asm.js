@@ -16,6 +16,12 @@ const RV = () => window.RV;
 const REGRE = /^(?:x(?:[12]?\d|3[01])|zero|ra|sp|gp|hp|tp|fp|t[0-6]|s(?:1[01]|\d)|a[0-7])\b/i;
 
 /* ------------------------------------------------------------------ language */
+let MNSET = null;
+const isOp = (w) => {
+  const rv = RV(); if (!rv) return false;
+  if (!MNSET) MNSET = new Set([...rv.MNEMONICS, ...rv.B_DIRECTIVES, "subi", "lla", "illegal", "uret", "sret", "mret", "wfi", "csrwi", "csrsi", "csrci"]);
+  return MNSET.has(w.toLowerCase());
+};
 const rvLang = StreamLanguage.define({
   name: "riscv",
   startState: () => ({ first: true }),
@@ -23,22 +29,27 @@ const rvLang = StreamLanguage.define({
     if (stream.sol()) st.first = true;
     if (stream.eatSpace()) return null;
     if (stream.match(/^(#|;|\/\/)/)) { stream.skipToEnd(); return "comment"; }
-    if (stream.match(/^"(?:[^"\\]|\\.)*"?/)) return "string";
+    if (stream.match(/^"(?:[^"\\]|\\.)*"?/) || stream.match(/^`(?:[^`\\]|\\.)*`?/)) return "string";
     if (stream.match(/^'(?:\\x[0-9a-fA-F]{1,2}|\\.|[^\\'])'/)) return "string";
-    if (st.first && stream.match(/^[A-Za-z_.$][\w.$]*\s*:/)) return "labelName";
-    if (st.first && stream.match(/^\d+:/)) return "labelName";
+    if (stream.match(/^%[bf]?\d+/i)) return "labelName";
+    if (st.first && stream.match(/^\d+(?=\s|:|$)/)) { stream.eat(":"); return "labelName"; }
     if (stream.match(/^\.[A-Za-z_]\w*/)) { st.first = false; return "meta"; }
     if (stream.match(/^%(?:hi|lo|pcrel_hi|pcrel_lo)\b/)) return "meta";
-    if (stream.match(/^(?:0x[0-9a-f_]+|0b[01_]+|0o[0-7_]+|\d+[bf]?)\b/i)) return "number";
+    if (stream.match(/^(?:0x[0-9a-f_]+|0b[01_]+|0o[0-7_]+|\$[0-9a-f_]+|@[0-7_]+|\d+[bf]?)\b/i)) return "number";
     if (stream.match(REGRE)) return "typeName";
-    if (stream.match(/^[A-Za-z_.$][\w.$]*/)) {
-      if (st.first) { st.first = false; return "keyword"; }
-      return "variableName";
+    const m = stream.match(/^[A-Za-z_.$][\w.$]*/);
+    if (m) {
+      if (st.first) {
+        if (isOp(m[0])) { st.first = false; const rv = RV(); return rv && rv.B_DIRECTIVES.includes(m[0].toLowerCase()) ? "meta" : "keyword"; }
+        stream.eat(":");
+        return "labelName";                   // a label (with or without ':'); the next word is the mnemonic
+      }
+      return /^[A-Z][A-Z0-9]+$/.test(m[0]) && RV() && RV().B_CSR[m[0]] !== undefined ? "typeName" : "variableName";
     }
     stream.next();
     return null;
   },
-  languageData: { commentTokens: { line: "#" } },
+  languageData: { commentTokens: { line: ";" } },
 });
 
 const highlight = HighlightStyle.define([
@@ -101,12 +112,16 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 
 function docLabels(state) {
   const out = [];
-  const re = /^\s*([A-Za-z_.$][\w.$]*)\s*:|^\s*\.(?:equ|set)\s+([A-Za-z_.$][\w.$]*)/gm;
   const text = state.doc.toString();
+  const re = /^[ \t]*([A-Za-z_.$][\w.$]*)[ \t]*:|^\s*\.(?:equ|set)\s+([A-Za-z_.$][\w.$]*)|^([A-Za-z_][\w]*)(?=\s|$)/gm;
   let m;
-  while ((m = re.exec(text))) out.push(m[1] || m[2]);
+  while ((m = re.exec(text))) { const w = m[1] || m[2] || m[3]; if (w && !(m[3] && isOp(w))) out.push(w); }
   return [...new Set(out)];
 }
+
+const B_DIR_DOC = { equ: "name EQU value — define a constant", org: "ORG addr — continue assembling at addr", align: "ALIGN [n[, fill]] — pad to a multiple of n (default 4)",
+  defs: "DEFS size[, fill] — reserve bytes", defb: "DEFB values / \"strings\" — bytes", defh: "DEFH values — 16-bit halfwords", defw: "DEFW values — 32-bit words",
+  dcb: "same as DEFB", dcw: "same as DEFH", dcd: "same as DEFW", origin: "same as ORG", entry: "mark the entry point (ignored)", export: "export labels (ignored)" };
 
 function completions(ctx) {
   const rv = RV(); if (!rv) return null;
@@ -117,13 +132,16 @@ function completions(ctx) {
   if (!w || (w.from === w.to && !ctx.explicit)) return null;
   const head = before.replace(/^\s*(?:[\w.$]+:\s*)*/, "");
   const firstWord = !/\s/.test(head.slice(0, w.from - line.from - (before.length - head.length)));
-  if (w.text.startsWith(".")) {
+  const bennett = HOOKS.dialect && HOOKS.dialect() === "bennett";
+  if (w.text.startsWith(".") && !bennett) {
     return { from: w.from, validFor: /^\.\w*$/, options: rv.DIRECTIVES.map(d => ({ label: d, type: "keyword", detail: "directive" })) };
   }
-  if (firstWord) {
+  const opsHere = firstWord || (bennett && /^\s*[A-Za-z_]\w*\s+[\w.]*$/.test(before) && !isOp(before.trim().split(/\s+/)[0]));
+  if (opsHere) {
     return {
       from: w.from, validFor: /^\w*$/,
-      options: rv.MNEMONICS.map(m => ({ label: m, type: rv.PSEUDO.includes(m) ? "function" : "keyword", detail: rv.DOC[m] || "", boost: rv.PSEUDO.includes(m) ? 0 : 1 })),
+      options: [...rv.MNEMONICS.map(m => ({ label: m, type: rv.PSEUDO.includes(m) ? "function" : "keyword", detail: rv.DOC[m] || "", boost: rv.PSEUDO.includes(m) ? 0 : 1 })),
+        ...(bennett ? Object.entries(B_DIR_DOC).map(([d, doc]) => ({ label: d, type: "keyword", detail: doc })) : [])],
     };
   }
   return {
@@ -156,6 +174,8 @@ function makeHover(hooks) {
       const v = hooks.regValue ? hooks.regValue(r) : null;
       html = `<div class="h-title"><b>${rv.ABI[r]}</b> <span class="h-dim">x${r}${lw === "fp" ? " (fp)" : lw === "hp" ? " (hp)" : ""}</span></div>` +
         `<div class="h-dim">${esc(rv.REG_ROLE[r])}${rv.REG_SAVER[r] ? ` · ${rv.REG_SAVER[r]}-saved` : ""}</div>` + (v != null ? `<div class="h-code">${esc(v)}</div>` : "");
+    } else if (B_DIR_DOC[lw] && hooks.dialect && hooks.dialect() === "bennett") {
+      html = `<div class="h-title"><span class="h-kind">directive</span> <b>${esc(lw.toUpperCase())}</b></div><div class="h-code">${esc(B_DIR_DOC[lw])}</div>`;
     } else if (rv.DOC[lw] && rv.MNEMONICS.includes(lw)) {
       html = `<div class="h-title"><span class="h-kind">${rv.PSEUDO.includes(lw) ? "pseudo-instruction" : "instruction"}</span> <b>${esc(lw)}</b></div><div class="h-code">${esc(rv.DOC[lw])}</div>`;
     } else if (hooks.symbol) {
@@ -168,8 +188,10 @@ function makeHover(hooks) {
 }
 
 /* ------------------------------------------------------------------ public */
+let HOOKS = {};
 export function createAsm(parent, opts = {}, theme) {
   const hooks = opts.hooks || {};
+  HOOKS = hooks;
   const bpGutter = gutter({
     class: "cm-bpGutter",
     markers: (v) => {

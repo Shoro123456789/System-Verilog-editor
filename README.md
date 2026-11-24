@@ -220,6 +220,22 @@ UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colou
 The **RISC-V** tab is a built-in assembler and debugger for RV32IM programs, similar to Bennett but
 running natively on Windows and Linux with no install. It works without opening a project.
 
+It has two **modes**:
+
+- **Bennett (COMP15111)**, the default, matches Bennett 1.2.16 and its `riscasm` assembler:
+  - **Syntax:** `;` comments; labels with or without `:`; `DEFW`/`DEFH`/`DEFB`/`DEFS`/`ALIGN`/`ORG`/`EQU`;
+    memory operands written `4[sp]`; local labels `1` referenced as `%b1`/`%f1`; `$hex`, `@octal` and
+    `AND`/`OR`/`MOD` in expressions; full-value `lui` (`lui a0, 0x12345000`); upper-case CSR names.
+  - **Machine:** 10,000 bytes of memory, every register (including `sp`) starts at 0, and execution starts at address 0.
+  - **ecall services** (number in `a7`): 0 print char `a0`, 1 read char into `a0`, 2 print string at `a0`,
+    3 print integer `a0`, 5 halt.
+  - **Tested against Bennett:** `tests/riscv/test_bennett.js` checks the encoding against output recorded from
+    Bennett's own assembler. GNU-only syntax gets an error explaining the Bennett form.
+- **Generic RV32 (GNU)** uses GNU/RARS syntax (`.text`, `.word`, `4(sp)`, `#` comments), RARS ecalls,
+  and memory up to 16 MiB with `sp` set for you.
+
+When you open a file, SV Studio switches to the mode that matches its syntax.
+
 - **Assemble** (F7) a `.s` file. Errors and warnings are underlined as you type.
 - **Run** (F5), **step** (F11), **step over** a call (F10), **step out** (Shift+F10), and **step back**
   (Shift+F11). Step back undoes one instruction at a time, including memory writes, for the last 200,000 instructions.
@@ -233,17 +249,14 @@ running natively on Windows and Linux with no install. It works without opening 
 - **Panes:** Trace (the last 300 instructions and what each changed), Memory (words or bytes; follow `sp`;
   double-click to edit), Call stack, Code (disassembly), and Symbols.
 - **Hover** an instruction for what it does, a register for its role and current value, or a label for its address.
-- **Console I/O** through `ecall` with the RARS/Venus service numbers in `a7`: 1 print int, 4 print string,
-  11 print char, 34 print hex, 5 read int, 8 read string, 12 read char, 10 exit, 93 exit with code `a0`,
-  and 63/64 read/write.
-- **Assembler:** GNU-style syntax with labels, numeric local labels (`1:` / `1b` / `1f`), `.text`/`.data`, `.word`/`.half`/`.byte`,
-  `.asciz`/`.string`, `.space`, `.align`, `.equ`, `%hi`/`%lo`, and the usual pseudo-instructions
-  (`li`, `la`, `mv`, `call`, `ret`, `j`, `beqz`, `bgt`, `lw rd, label`…). Code starts at `0x0`, data follows it,
-  and `sp` starts at the top of memory (1 MiB by default).
-- **Open** `.hex`/`.txt` (one word per line), `.bin`, or `.kmd` images, then follow them in the Code tab.
-- **Where it differs from Bennett:** it doesn't connect to the lab FPGA boards. Bennett uses the
-  university's own assembler, so a directive that only Bennett supports may need changing. Check
-  marked work in Bennett.
+- **Console I/O** through `ecall`, with input typed into the console. Generic mode also supports
+  RARS print/read int, string and char, exit (10 and 93), and write/read (64/63).
+- **Generic mode assembler** supports labels, numeric local labels (`1:` / `1b` / `1f`), `.text`/`.data`,
+  `.word`/`.half`/`.byte`, `.asciz`, `.space`, `.align`, `.equ`, `%hi`/`%lo`, and the usual pseudo-instructions.
+- **Open** `.s`, `.kmd` (Bennett's listing format, including symbols), `.hex`/`.txt` or `.bin` files.
+- **Not supported:** the lab FPGA boards, and the rarely used `RECORD`, `INCLUDE`, `IF` and literal-pool
+  directives in Bennett mode. Out-of-range memory accesses stop with an explanation, where Bennett would
+  silently return `0xDEADBEFF` or drop the store.
 
 ## FPGA timing (Vivado)
 

@@ -621,3 +621,4 @@ body.resizing * { cursor: col-resize !important; }
 .rv-code .ln { color: var(--dim); text-align: right; }
 .rv-sym .rv-row { grid-template-columns: 1fr 90px 50px; }
 .mline .mw span.lab { border-bottom: 1px dotted #89ddff; }
+#rvConHint { text-transform: none; letter-spacing: 0; }
