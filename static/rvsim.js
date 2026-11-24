@@ -379,6 +379,7 @@ function tick(first) {
     el("#rvRun").querySelector("span").textContent = "Run";
     if (m.status === "running") m.status = "paused";
     if (stopMsg) sys(stopMsg, "sys");
+    R.resume = "run";
     reportStatus();
     refresh(true);
     return;
@@ -408,6 +409,7 @@ function stepOnce() {
   stop();
   const nAbi = R.m.abiWarnings.length;
   R.m.step();
+  R.resume = "step";
   for (const w of R.m.abiWarnings.slice(nAbi)) sys(`⚠ ABI: ${w.msg} (line ${lineOf(w.pc) || "?"})`, "warn");
   if (R.m.status === "running" || R.m.status === "ready") R.m.status = "paused";
   if (R.m.status !== "paused") reportStatus(); else setStatus("Paused", "");
@@ -441,20 +443,44 @@ el("#rvReset").onclick = () => reset();
 el("#rvMem").onchange = () => { LS.set("rv.mem", +el("#rvMem").value); if (R.asm) assemble(true); };
 
 /* ---------------------------------------------------------------- input (read syscalls) */
+// Bennett mode: a raw keyboard like Bennett's terminal — each key goes straight to the program
+// (Enter sends a newline, character 10), with no echo. Generic mode: line input with a Send button.
 function askInput() {
-  const kind = { int: "Enter an integer", line: "Enter text", char: "Type characters (Enter sends a newline too)" }[R.m.pendingInput] || "Input";
+  const raw = R.mode === "bennett";
+  const kind = raw ? "Keyboard — the program is waiting for a key" : { int: "Enter an integer", line: "Enter text", char: "Enter text" }[R.m.pendingInput] || "Input";
   el("#rvInputLabel").textContent = kind + " ›";
+  el("#rvInput").placeholder = raw ? "each key you press is sent straight away (Enter = newline)" : "";
+  el("#rvInputForm").querySelector("button").hidden = raw;
   el("#rvInputForm").hidden = false;
   setStatus("Waiting for input", "running");
   el("#rvInput").value = ""; el("#rvInput").focus();
 }
+function resumeAfterInput() {
+  if (R.m.status !== "paused") return;
+  if (R.resume === "step") { stepOnce(); if (R.m.status !== "input") el("#rvInputForm").hidden = true; }
+  else { el("#rvInputForm").hidden = true; run(); }
+}
+el("#rvInput").addEventListener("keydown", (e) => {
+  if (R.mode !== "bennett") return;
+  let ch = null;
+  if (e.key === "Enter") ch = "\n";
+  else if (e.key === "Backspace") ch = "\b";
+  else if (e.key === "Tab") ch = "\t";
+  else if (e.key === "Escape") ch = "\x1b";
+  else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) ch = e.key;
+  if (ch === null) return;
+  e.preventDefault(); e.stopPropagation();
+  R.m.provideInput(ch);
+  resumeAfterInput();
+});
 el("#rvInputForm").onsubmit = (e) => {
   e.preventDefault();
+  if (R.mode === "bennett") return;
   const v = el("#rvInput").value;
   conOut(v + "\n", "sys");
   el("#rvInputForm").hidden = true;
   R.m.provideInput(v + "\n");
-  run();
+  resumeAfterInput();
 };
 
 /* ---------------------------------------------------------------- rendering */
