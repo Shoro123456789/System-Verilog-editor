@@ -76,6 +76,7 @@
       <button data-tab="editor">Editor <span class="badge dim" id="editorBadge" hidden></span></button>
       <button data-tab="board">Board <span class="badge info" id="boardBadge" hidden>live</span></button>
       <button data-tab="timing">Timing <span class="badge" id="timingBadge" hidden></span></button>
+      <button data-tab="riscv">RISC-V <span class="badge info" id="rvBadge" hidden></span></button>
     </nav>
 
     <section class="tab active" id="tab-console">
@@ -254,6 +255,73 @@
       </div>
     </section>
 
+    <section class="tab" id="tab-riscv">
+      <div class="board-bar rv-bar">
+        <div class="rv-file">
+          <button class="btn sm" id="rvNew" title="New program">New</button>
+          <button class="btn sm" id="rvOpen" title="Open .s / .hex / .bin (Ctrl+O)">Open</button>
+          <button class="btn sm" id="rvSave" title="Save (Ctrl+S)">Save</button>
+          <span class="rv-fname" id="rvFile">untitled.s</span>
+        </div>
+        <div class="rv-sep"></div>
+        <button class="btn sm" id="rvAsm" title="Assemble and load (F7)"><svg viewBox="0 0 24 24"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg>Assemble</button>
+        <button class="btn primary sm" id="rvRun" title="Run / continue (F5)"><svg viewBox="0 0 24 24"><path class="fill" d="M7 4l13 8-13 8z"/></svg><span>Run</span></button>
+        <div class="rv-steps">
+          <button class="icon-btn sm" id="rvBack" title="Step back — undo one instruction (Shift+F11)"><svg viewBox="0 0 24 24"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/></svg></button>
+          <button class="icon-btn sm" id="rvStep" title="Step into (F11)"><svg viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M6 20h12"/></svg></button>
+          <button class="icon-btn sm" id="rvOver" title="Step over — run a whole call (F10)"><svg viewBox="0 0 24 24"><path d="M4 14a8 8 0 0 1 15-4M19 4v6h-6"/><circle cx="12" cy="18" r="2"/></svg></button>
+          <button class="icon-btn sm" id="rvOut" title="Step out — run until this function returns (Shift+F10)"><svg viewBox="0 0 24 24"><path d="M12 20V8M7 13l5-5 5 5M6 4h12"/></svg></button>
+          <button class="icon-btn sm" id="rvReset" title="Reset — reload the program (Ctrl+Shift+F5)"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg></button>
+        </div>
+        <label class="field"><span>Speed</span><select id="rvSpeed">
+          <option value="0">Max</option><option value="2000">2000/s</option><option value="200">200/s</option>
+          <option value="20">20/s</option><option value="4">4/s</option><option value="1">1/s</option></select></label>
+        <label class="field"><span>Memory</span><select id="rvMem">
+          <option value="65536">64 KiB</option><option value="1048576" selected>1 MiB</option><option value="16777216">16 MiB</option></select></label>
+        <span class="job-chip" id="rvStatus">Not assembled</span>
+        <div class="spacer"></div>
+        <span class="muted small" id="rvCycles"></span>
+      </div>
+      <div class="rv-body">
+        <div class="rv-left">
+          <div class="rv-editor" id="rvEditor"></div>
+          <div class="rv-console">
+            <div class="rv-panel-head"><span>Console</span><span class="muted small" id="rvConHint"></span><div class="spacer"></div>
+              <button class="btn ghost sm" id="rvConClear">Clear</button></div>
+            <div class="rv-con" id="rvCon"></div>
+            <form class="rv-input" id="rvInputForm" hidden><span id="rvInputLabel">Input</span><input id="rvInput" autocomplete="off" spellcheck="false"><button class="btn primary sm">Send</button></form>
+          </div>
+        </div>
+        <div class="rv-resizer" id="rvResize" title="Drag to resize"></div>
+        <div class="rv-right" id="rvRight">
+          <div class="rv-regs">
+            <div class="rv-panel-head"><span>Registers</span><div class="spacer"></div>
+              <div class="seg-toggle sm" id="rvNames"><button data-v="abi" class="active">ABI</button><button data-v="x">x0–x31</button></div>
+              <div class="seg-toggle sm" id="rvFmt"><button data-v="hex" class="active">Hex</button><button data-v="dec">Dec</button><button data-v="udec">Unsigned</button><button data-v="bin">Bin</button><button data-v="chr">Char</button></div>
+            </div>
+            <div class="rv-pc" id="rvPc"></div>
+            <div class="rv-reggrid" id="rvRegs"></div>
+            <div class="rv-legend"><span><i class="lg callee"></i>callee-saved (s0–s11, sp)</span><span><i class="lg arg"></i>arguments a0–a7</span><span><i class="lg tmp"></i>temporaries</span><span class="muted">click a register for its history</span></div>
+          </div>
+          <div class="rv-tabs" id="rvTabs">
+            <button data-p="hist" class="active">History</button><button data-p="trace">Trace</button><button data-p="mem">Memory</button>
+            <button data-p="stack">Call stack <span class="badge" id="rvAbiBadge" hidden></span></button><button data-p="code">Code</button><button data-p="sym">Symbols</button>
+          </div>
+          <div class="rv-pane active" id="rvP-hist"><div class="rv-empty">Click a register to see every value it has held, with the instruction that wrote it.</div></div>
+          <div class="rv-pane" id="rvP-trace"></div>
+          <div class="rv-pane" id="rvP-mem">
+            <div class="rv-memhead"><input id="rvMemAddr" value="0" spellcheck="false" title="Address, label or register (e.g. 0x100, msg, sp)">
+              <button class="btn sm" id="rvMemGo">Go</button>
+              <label class="check"><input type="checkbox" id="rvMemFollow"> follow sp</label>
+              <div class="seg-toggle sm" id="rvMemFmt"><button data-v="w" class="active">Words</button><button data-v="b">Bytes</button></div></div>
+            <div class="rv-mem" id="rvMemView"></div>
+          </div>
+          <div class="rv-pane" id="rvP-stack"></div>
+          <div class="rv-pane" id="rvP-code"></div>
+          <div class="rv-pane" id="rvP-sym"></div>
+        </div>
+      </div>
+    </section>
     <section class="tab" id="tab-editor">
       <div class="editor-bar">
         <div class="ed-tabs" id="edTabs"></div>
@@ -343,5 +411,7 @@
 <script src="timing.js"></script>
 <script src="lint.js"></script>
 <script src="update.js"></script>
+<script src="riscv.js"></script>
+<script src="rvsim.js"></script>
 </body>
 </html>

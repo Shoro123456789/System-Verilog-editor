@@ -20,6 +20,7 @@ import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { lintGutter, setDiagnostics, lintKeymap } from "@codemirror/lint";
 import { verilog } from "@codemirror/legacy-modes/mode/verilog";
 import { tags as t } from "@lezer/highlight";
+import { createAsm } from "./asm.js";
 
 /* ------------------------------------------------------------------ language */
 const svLang = StreamLanguage.define(verilog);
@@ -466,4 +467,4 @@ function create(parent, opts = {}) {
   };
 }
 
-window.SVEditor = { create };
+window.SVEditor = { create, createAsm: (parent, opts) => createAsm(parent, opts, theme) };

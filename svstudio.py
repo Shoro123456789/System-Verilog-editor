@@ -2180,6 +2180,8 @@ def browse_dialog(kind, start):
         f"k = {kind!r}; s = {start!r} or None\n"
         "if k == 'dir': p = filedialog.askdirectory(initialdir=s, title='Open project folder')\n"
         "elif k == 'vcd': p = filedialog.askopenfilename(initialdir=s, title='Open VCD waveform', filetypes=[('VCD', '*.vcd'), ('All', '*.*')])\n"
+        "elif k == 'asm': p = filedialog.askopenfilename(initialdir=s, title='Open RISC-V program', filetypes=[('RISC-V assembly', '*.s *.S *.asm'), ('Memory image', '*.hex *.txt *.bin'), ('All', '*.*')])\n"
+        "elif k == 'asmsave': p = filedialog.asksaveasfilename(initialdir=s, title='Save RISC-V program', defaultextension='.s', filetypes=[('RISC-V assembly', '*.s *.S *.asm'), ('All', '*.*')])\n"
         "else: p = filedialog.askopenfilename(initialdir=s, title='Open Questa project', filetypes=[('Questa project', '*.mpf'), ('HDL', '*.sv *.v'), ('All', '*.*')])\n"
         "import os\nout = os.environ.get('SVS_OUT')\n"
         "open(out, 'w', encoding='utf-8').write(p or '') if out else sys.stdout.write(p or '')\n"
@@ -2219,6 +2221,35 @@ def open_vscode(path, line=None, root=None):
         args.append(path)
     kw = {"creationflags": 0x08000000} if IS_WIN else {"start_new_session": True}
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+
+ASM_TEXT_EXT = {".s", ".asm"}
+ASM_READ_EXT = ASM_TEXT_EXT | {".hex", ".txt", ".bin", ".kmd"}
+
+
+def asm_read(path):
+    """Read a RISC-V source or memory image for the RISC-V tab (any folder, limited file types)."""
+    p = Path(path).expanduser()
+    if p.suffix.lower() not in ASM_READ_EXT:
+        raise RuntimeError("Open a .s/.asm source or a .hex/.txt/.bin memory image")
+    if not p.is_file():
+        raise RuntimeError(f"File not found: {p}")
+    if p.stat().st_size > 16 * 1024 * 1024:
+        raise RuntimeError("File is larger than 16 MB")
+    if p.suffix.lower() == ".bin":
+        import base64
+        return {"path": str(p), "binary": base64.b64encode(p.read_bytes()).decode("ascii")}
+    return {"path": str(p), "text": p.read_text(encoding="utf-8", errors="replace")}
+
+
+def asm_save(path, text):
+    p = Path(path).expanduser()
+    if p.suffix.lower() not in ASM_TEXT_EXT:
+        raise RuntimeError("RISC-V programs are saved as .s or .asm files")
+    if not p.parent.is_dir():
+        raise RuntimeError(f"Folder does not exist: {p.parent}")
+    p.write_text(text, encoding="utf-8", newline="")
+    return {"ok": True, "path": str(p)}
 
 
 def _allowed(path, root):
@@ -2491,8 +2522,14 @@ class Handler(BaseHTTPRequestHandler):
                 proj = STATE["project"]
                 open_vscode(b.get("path"), b.get("line"), proj["root"] if proj else None)
                 return self._send(200, {"ok": True})
+            if u.path == "/api/asm/read":
+                return self._send(200, asm_read(b.get("path", "")))
+            if u.path == "/api/asm/save":
+                return self._send(200, asm_save(b.get("path", ""), b.get("text", "")))
             if u.path == "/api/browse":
                 start = STATE["project"]["root"] if STATE["project"] else str(Path.home())
+                if b.get("start") and Path(b["start"]).expanduser().is_dir():
+                    start = str(Path(b["start"]).expanduser())
                 return self._send(200, {"path": browse_dialog(b.get("kind", "file"), start)})
             if u.path == "/api/config":
                 for k, v in b.items():

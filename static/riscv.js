@@ -1,0 +1,889 @@
+// SV Studio — RISC-V (RV32IM + Zicsr counters) assembler, disassembler and emulator.
+// Pure JS, no DOM: used by rvsim.js in the browser and by tests under node.
+(function (root) {
+"use strict";
+
+/* ------------------------------------------------------------------ registers */
+const ABI = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+  "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"];
+const REG_ROLE = ["hard-wired zero", "return address", "stack pointer", "global/heap pointer", "thread pointer",
+  "temporary", "temporary", "temporary", "saved / frame pointer", "saved", "argument / return value", "argument / return value",
+  "argument", "argument", "argument", "argument", "argument", "argument / syscall number", "saved", "saved", "saved",
+  "saved", "saved", "saved", "saved", "saved", "saved", "saved", "temporary", "temporary", "temporary", "temporary"];
+// who must preserve it across a call: "callee" = the called function must restore it
+const REG_SAVER = ABI.map((n, i) => i === 0 ? "" : i === 2 || n[0] === "s" ? "callee" : i === 3 || i === 4 ? "" : "caller");
+const REGMAP = new Map();
+ABI.forEach((n, i) => { REGMAP.set(n, i); REGMAP.set("x" + i, i); });
+REGMAP.set("fp", 8); REGMAP.set("hp", 3);
+const regNum = (s) => REGMAP.has(s.toLowerCase()) ? REGMAP.get(s.toLowerCase()) : -1;
+
+/* ------------------------------------------------------------------ instruction table */
+const R = { add: [0, 0], sub: [0, 32], sll: [1, 0], slt: [2, 0], sltu: [3, 0], xor: [4, 0], srl: [5, 0], sra: [5, 32], or: [6, 0], and: [7, 0],
+  mul: [0, 1], mulh: [1, 1], mulhsu: [2, 1], mulhu: [3, 1], div: [4, 1], divu: [5, 1], rem: [6, 1], remu: [7, 1] };
+const IALU = { addi: 0, slti: 2, sltiu: 3, xori: 4, ori: 6, andi: 7 };
+const SHI = { slli: [1, 0], srli: [5, 0], srai: [5, 32] };
+const LOAD = { lb: 0, lh: 1, lw: 2, lbu: 4, lhu: 5 };
+const STORE = { sb: 0, sh: 1, sw: 2 };
+const BR = { beq: 0, bne: 1, blt: 4, bge: 5, bltu: 6, bgeu: 7 };
+const CSR = { csrrw: 1, csrrs: 2, csrrc: 3, csrrwi: 5, csrrsi: 6, csrrci: 7 };
+const CSRNAMES = { cycle: 0xC00, time: 0xC01, instret: 0xC02, cycleh: 0xC80, timeh: 0xC81, instreth: 0xC82,
+  mstatus: 0x300, misa: 0x301, mie: 0x304, mtvec: 0x305, mscratch: 0x340, mepc: 0x341, mcause: 0x342, mtval: 0x343, mip: 0x344,
+  mcycle: 0xB00, minstret: 0xB02, mhartid: 0xF14 };
+const CSRBYNUM = Object.fromEntries(Object.entries(CSRNAMES).map(([k, v]) => [v, k]));
+
+// One-line docs shown in hover/completion.
+const DOC = {
+  add: "rd = rs1 + rs2", sub: "rd = rs1 - rs2", sll: "rd = rs1 << rs2[4:0]", slt: "rd = (rs1 < rs2) signed ? 1 : 0",
+  sltu: "rd = (rs1 < rs2) unsigned ? 1 : 0", xor: "rd = rs1 ^ rs2", srl: "rd = rs1 >> rs2 (logical)", sra: "rd = rs1 >> rs2 (arithmetic)",
+  or: "rd = rs1 | rs2", and: "rd = rs1 & rs2", mul: "rd = (rs1 * rs2)[31:0]", mulh: "rd = (rs1 * rs2)[63:32] signed×signed",
+  mulhsu: "rd = (rs1 * rs2)[63:32] signed×unsigned", mulhu: "rd = (rs1 * rs2)[63:32] unsigned", div: "rd = rs1 / rs2 (signed)",
+  divu: "rd = rs1 / rs2 (unsigned)", rem: "rd = rs1 % rs2 (signed)", remu: "rd = rs1 % rs2 (unsigned)",
+  addi: "rd = rs1 + imm12", slti: "rd = (rs1 < imm) signed", sltiu: "rd = (rs1 < imm) unsigned", xori: "rd = rs1 ^ imm",
+  ori: "rd = rs1 | imm", andi: "rd = rs1 & imm", slli: "rd = rs1 << shamt", srli: "rd = rs1 >> shamt (logical)", srai: "rd = rs1 >> shamt (arithmetic)",
+  lb: "rd = sign-extend mem8[rs1+imm]", lh: "rd = sign-extend mem16[rs1+imm]", lw: "rd = mem32[rs1+imm]",
+  lbu: "rd = zero-extend mem8[rs1+imm]", lhu: "rd = zero-extend mem16[rs1+imm]",
+  sb: "mem8[rs1+imm] = rs2", sh: "mem16[rs1+imm] = rs2", sw: "mem32[rs1+imm] = rs2",
+  beq: "if rs1 == rs2 goto label", bne: "if rs1 != rs2 goto label", blt: "if rs1 < rs2 (signed) goto label",
+  bge: "if rs1 >= rs2 (signed) goto label", bltu: "if rs1 < rs2 (unsigned) goto label", bgeu: "if rs1 >= rs2 (unsigned) goto label",
+  lui: "rd = imm20 << 12", auipc: "rd = pc + (imm20 << 12)", jal: "rd = pc+4; goto label  (jal label ⇒ rd = ra)",
+  jalr: "rd = pc+4; goto rs1+imm", ecall: "environment call (a7 = service number)", ebreak: "breakpoint — pauses the simulator",
+  fence: "memory ordering (no-op here)", csrrw: "rd = csr; csr = rs1", csrrs: "rd = csr; csr |= rs1", csrrc: "rd = csr; csr &= ~rs1",
+  csrrwi: "rd = csr; csr = uimm", csrrsi: "rd = csr; csr |= uimm", csrrci: "rd = csr; csr &= ~uimm",
+  // pseudo
+  nop: "addi zero, zero, 0", li: "rd = immediate (lui + addi if needed)", la: "rd = address of label (auipc + addi)",
+  mv: "rd = rs  (addi rd, rs, 0)", not: "rd = ~rs  (xori rd, rs, -1)", neg: "rd = -rs  (sub rd, zero, rs)",
+  seqz: "rd = (rs == 0)", snez: "rd = (rs != 0)", sltz: "rd = (rs < 0)", sgtz: "rd = (rs > 0)",
+  beqz: "if rs == 0 goto label", bnez: "if rs != 0 goto label", blez: "if rs <= 0 goto label", bgez: "if rs >= 0 goto label",
+  bltz: "if rs < 0 goto label", bgtz: "if rs > 0 goto label", bgt: "if rs1 > rs2 goto label", ble: "if rs1 <= rs2 goto label",
+  bgtu: "if rs1 > rs2 (unsigned) goto label", bleu: "if rs1 <= rs2 (unsigned) goto label",
+  j: "goto label  (jal zero, label)", jr: "goto rs  (jalr zero, 0(rs))", ret: "return  (jalr zero, 0(ra))",
+  call: "call function  (jal ra, label)", tail: "tail call  (jal zero, label)", rdcycle: "rd = cycle counter",
+  rdinstret: "rd = instructions retired", rdtime: "rd = time counter", csrr: "rd = csr", csrw: "csr = rs", csrs: "csr |= rs", csrc: "csr &= ~rs",
+};
+const PSEUDO = ["nop", "li", "la", "mv", "not", "neg", "seqz", "snez", "sltz", "sgtz", "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+  "bgt", "ble", "bgtu", "bleu", "j", "jr", "ret", "call", "tail", "rdcycle", "rdinstret", "rdtime", "csrr", "csrw", "csrs", "csrc"];
+const REAL = [...Object.keys(R), ...Object.keys(IALU), ...Object.keys(SHI), ...Object.keys(LOAD), ...Object.keys(STORE),
+  ...Object.keys(BR), "lui", "auipc", "jal", "jalr", "ecall", "ebreak", "fence", ...Object.keys(CSR)];
+const MNEMONICS = [...REAL, ...PSEUDO];
+const DIRECTIVES = [".text", ".data", ".rodata", ".bss", ".section", ".word", ".half", ".short", ".byte", ".2byte", ".4byte", ".long",
+  ".ascii", ".asciz", ".string", ".space", ".zero", ".skip", ".align", ".balign", ".p2align", ".equ", ".set", ".globl", ".global",
+  ".org", ".end", ".option", ".type", ".size", ".file", ".ident", ".attribute", ".local", ".weak"];
+
+/* ------------------------------------------------------------------ encoders */
+const u32 = (v) => v >>> 0;
+const encR = (f7, rs2, rs1, f3, rd, op) => u32((f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op);
+const encI = (imm, rs1, f3, rd, op) => u32(((imm & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op);
+const encS = (imm, rs2, rs1, f3, op) => u32((((imm >> 5) & 0x7f) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | ((imm & 0x1f) << 7) | op);
+const encB = (imm, rs2, rs1, f3) => u32((((imm >> 12) & 1) << 31) | (((imm >> 5) & 0x3f) << 25) | (rs2 << 20) | (rs1 << 15) |
+  (f3 << 12) | (((imm >> 1) & 0xf) << 8) | (((imm >> 11) & 1) << 7) | 0x63);
+const encU = (imm20, rd, op) => u32(((imm20 & 0xfffff) << 12) | (rd << 7) | op);
+const encJ = (imm, rd) => u32((((imm >> 20) & 1) << 31) | (((imm >> 1) & 0x3ff) << 21) | (((imm >> 11) & 1) << 20) |
+  (((imm >> 12) & 0xff) << 12) | (rd << 7) | 0x6f);
+const hiLo = (v) => { v = v | 0; const lo = (v << 20) >> 20; const hi = ((v - lo) >>> 12) & 0xfffff; return [hi, lo]; };
+
+/* ------------------------------------------------------------------ expressions */
+class AsmError extends Error {}
+
+function parseNumber(tok) {
+  const t = tok.replace(/_/g, "");
+  if (/^0x[0-9a-f]+$/i.test(t)) return parseInt(t.slice(2), 16);
+  if (/^0b[01]+$/i.test(t)) return parseInt(t.slice(2), 2);
+  if (/^0o[0-7]+$/i.test(t)) return parseInt(t.slice(2), 8);
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  return null;
+}
+
+function unescapeChar(s, i) { // returns [char code, next index]; s[i] is char after backslash
+  const c = s[i];
+  const map = { n: 10, t: 9, r: 13, 0: 0, "\\": 92, "'": 39, '"': 34, a: 7, b: 8, f: 12, v: 11, e: 27 };
+  if (c === "x") { const m = /^[0-9a-fA-F]{1,2}/.exec(s.slice(i + 1)); if (m) return [parseInt(m[0], 16), i + 1 + m[0].length]; }
+  if (c in map) return [map[c], i + 1];
+  return [c.charCodeAt(0), i + 1];
+}
+
+// Evaluates an expression; lookup(name) returns a number or undefined.
+function evalExpr(src, lookup, pc) {
+  const s = src.trim();
+  let i = 0;
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  const fail = (m) => { throw new AsmError(m || `bad expression "${src}"`); };
+  function primary() {
+    ws();
+    const c = s[i];
+    if (c === "(") { i++; const v = expr(); ws(); if (s[i] !== ")") fail("missing )"); i++; return v; }
+    if (c === "-") { i++; return -primary(); }
+    if (c === "+") { i++; return primary(); }
+    if (c === "~") { i++; return ~primary(); }
+    if (c === "'") {
+      i++; let code;
+      if (s[i] === "\\") [code, i] = unescapeChar(s, i + 1); else code = s.charCodeAt(i++);
+      if (s[i] !== "'") fail("bad character literal"); i++; return code;
+    }
+    if (c === "%") {
+      const m = /^%(hi|lo|pcrel_hi|pcrel_lo)\s*\(/.exec(s.slice(i)); if (!m) fail();
+      i += m[0].length; const v = expr(); ws(); if (s[i] !== ")") fail("missing )"); i++;
+      const [hi, lo] = hiLo(m[1].startsWith("pcrel") ? v - (m[1] === "pcrel_hi" ? pc : 0) : v);
+      return m[1].endsWith("hi") ? hi : lo;
+    }
+    if (c === "." && !/[A-Za-z_.$0-9]/.test(s[i + 1] || "")) { i++; return pc; }
+    let m = /^[0-9][0-9a-zA-Z_]*/.exec(s.slice(i));
+    if (m) {
+      i += m[0].length;
+      if (/^\d+[bf]$/.test(m[0])) { const v = lookup(m[0]); if (v === undefined) fail(`undefined local label ${m[0]}`); return v; }
+      const v = parseNumber(m[0]); if (v === null) fail(`bad number "${m[0]}"`); return v;
+    }
+    m = /^[A-Za-z_.$][\w.$]*/.exec(s.slice(i));
+    if (m) { i += m[0].length; const v = lookup(m[0]); if (v === undefined) throw new AsmError(`undefined symbol "${m[0]}"`); return v; }
+    fail();
+  }
+  const ops = [["|"], ["^"], ["&"], ["<<", ">>"], ["+", "-"], ["*", "/", "%"]];
+  function level(n) {
+    if (n === ops.length) return primary();
+    let v = level(n + 1);
+    for (;;) {
+      ws();
+      const op = ops[n].find(o => s.startsWith(o, i) && !(o === "%" && /^%(hi|lo|pcrel)/.test(s.slice(i))));
+      if (!op) return v;
+      i += op.length;
+      const r = level(n + 1);
+      switch (op) {
+        case "|": v = v | r; break; case "^": v = v ^ r; break; case "&": v = v & r; break;
+        case "<<": v = v << r; break; case ">>": v = v >> r; break;
+        case "+": v = v + r; break; case "-": v = v - r; break; case "*": v = Math.imul(v, r); break;
+        case "/": if (!r) fail("divide by zero"); v = Math.trunc(v / r); break; case "%": if (!r) fail("divide by zero"); v = v % r; break;
+      }
+    }
+  }
+  const expr = () => level(0);
+  if (!s) fail("missing operand");
+  const v = expr(); ws();
+  if (i < s.length) fail();
+  return v;
+}
+
+/* ------------------------------------------------------------------ source scanning */
+// Strip comments (# // ;) outside quotes; split into label(s) + statement.
+function stripComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) { if (c === "\\") i++; else if (c === q) q = null; continue; }
+    if (c === '"') { q = c; continue; }
+    if (c === "'" ) { // char literal 'x' or '\n'
+      const m = /^'(\\x[0-9a-fA-F]{1,2}|\\.|[^\\'])'/.exec(line.slice(i)); if (m) { i += m[0].length - 1; continue; }
+    }
+    if (c === "#" || c === ";" || (c === "/" && line[i + 1] === "/")) return line.slice(0, i);
+  }
+  return line;
+}
+
+function splitArgs(s) {
+  const out = []; let cur = "", depth = 0, q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === "\\") { cur += s[++i] || ""; } else if (c === q) q = null; continue; }
+    if (c === '"') { q = c; cur += c; continue; }
+    if (c === "'") { const m = /^'(\\x[0-9a-fA-F]{1,2}|\\.|[^\\'])'/.exec(s.slice(i)); if (m) { cur += m[0]; i += m[0].length - 1; continue; } }
+    if (c === "(") depth++; else if (c === ")") depth--;
+    if (c === "," && depth === 0) { out.push(cur.trim()); cur = ""; continue; }
+    cur += c;
+  }
+  if (cur.trim() || out.length) out.push(cur.trim());
+  return out;
+}
+
+function parseString(arg) {
+  const t = arg.trim();
+  if (t[0] !== '"' || t[t.length - 1] !== '"' || t.length < 2) throw new AsmError(`expected a "string", got ${arg}`);
+  const bytes = [];
+  for (let i = 1; i < t.length - 1;) {
+    if (t[i] === "\\") { const [c, n] = unescapeChar(t, i + 1); bytes.push(c & 0xff); i = n; }
+    else { const cp = t.codePointAt(i); const enc = new TextEncoder().encode(String.fromCodePoint(cp)); bytes.push(...enc); i += cp > 0xffff ? 2 : 1; }
+  }
+  return bytes;
+}
+
+/* ------------------------------------------------------------------ assembler */
+// Returns { ok, errors[], warnings[], image: Uint8Array-like chunks, symbols, lineToAddr, addrToLine, entry, textRange, dataRange }
+function assemble(source, opts = {}) {
+  const textBase = opts.textBase ?? 0;
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const errors = [], warnings = [];
+  const err = (ln, msg) => errors.push({ line: ln, message: msg, severity: "error" });
+  const warn = (ln, msg) => warnings.push({ line: ln, message: msg, severity: "warning" });
+
+  // ---------- pass 1: parse + size + section-relative labels
+  const items = [];             // { ln, sec, off, size, kind, op, args }
+  const consts = new Map();     // .equ
+  const labels = new Map();     // name -> { sec, off, ln }
+  const locals = [];            // { name: "1", sec, off, idx }
+  const secOff = { text: 0, data: 0 };
+  const secOrg = { text: false, data: false };
+  let sec = "text";
+  let ended = false;
+
+  const constLookup = (n) => consts.get(n);
+
+  for (let li = 0; li < lines.length && !ended; li++) {
+    const ln = li + 1;
+    let s = stripComment(lines[li]).trim();
+    if (!s) continue;
+    // labels (possibly several)
+    let m;
+    while ((m = /^([A-Za-z_.$][\w.$]*|\d+)\s*:(?!=)/.exec(s))) {
+      const name = m[1];
+      if (/^\d+$/.test(name)) locals.push({ name, sec, off: secOff[sec], idx: items.length });
+      else if (labels.has(name) || consts.has(name)) err(ln, `label "${name}" is defined more than once`);
+      else if (regNum(name) >= 0 || MNEMONICS.includes(name.toLowerCase())) err(ln, `"${name}" is a register/instruction name and can't be a label`);
+      else labels.set(name, { sec, off: secOff[sec], ln });
+      s = s.slice(m[0].length).trim();
+    }
+    if (!s) continue;
+    // name = expr
+    if ((m = /^([A-Za-z_.$][\w.$]*)\s*=\s*(.+)$/.exec(s))) { s = `.equ ${m[1]}, ${m[2]}`; }
+    const sp = s.search(/\s/);
+    const op = (sp < 0 ? s : s.slice(0, sp)).toLowerCase();
+    const rest = sp < 0 ? "" : s.slice(sp + 1).trim();
+    const args = rest ? splitArgs(rest) : [];
+    const push = (kind, size, extra = {}) => { items.push({ ln, sec, off: secOff[sec], size, kind, op, args, ...extra }); secOff[sec] += size; };
+    try {
+      if (op[0] === ".") {
+        switch (op) {
+          case ".text": sec = "text"; break;
+          case ".data": case ".rodata": case ".bss": case ".sdata": case ".sbss": sec = "data"; break;
+          case ".section": sec = /^\.?text/.test((args[0] || "").replace(/^\./, ".")) || (args[0] || "").startsWith(".text") ? "text" : "data"; break;
+          case ".globl": case ".global": case ".local": case ".weak": case ".option": case ".type": case ".size": case ".file":
+          case ".ident": case ".attribute": case ".extern": break;
+          case ".end": ended = true; break;
+          case ".equ": case ".set": {
+            if (args.length !== 2) throw new AsmError(`${op} needs: name, value`);
+            consts.set(args[0], evalExpr(args[1], (n) => consts.get(n), secOff[sec]));
+            break;
+          }
+          case ".word": case ".4byte": case ".long": if (!args.length) throw new AsmError(`${op} needs a value`); alignWarn(4); push("data", 4 * args.length, { width: 4 }); break;
+          case ".half": case ".short": case ".2byte": if (!args.length) throw new AsmError(`${op} needs a value`); alignWarn(2); push("data", 2 * args.length, { width: 2 }); break;
+          case ".byte": if (!args.length) throw new AsmError(`${op} needs a value`); push("data", args.length, { width: 1 }); break;
+          case ".ascii": case ".asciz": case ".string": {
+            const bytes = [];
+            for (const a of args) { bytes.push(...parseString(a)); if (op !== ".ascii") bytes.push(0); }
+            push("bytes", bytes.length, { bytes });
+            break;
+          }
+          case ".space": case ".zero": case ".skip": {
+            const n = evalExpr(args[0] || "", constLookup, secOff[sec]);
+            if (n < 0 || n > 16 * 1024 * 1024) throw new AsmError(`bad size ${n}`);
+            const fill = args[1] ? evalExpr(args[1], constLookup, 0) & 0xff : 0;
+            push("bytes", n, { bytes: null, fill });
+            break;
+          }
+          case ".align": case ".p2align": case ".balign": {
+            const v = evalExpr(args[0] || "", constLookup, 0);
+            const a = op === ".balign" ? v : 1 << v;
+            if (a <= 0 || a & (a - 1)) throw new AsmError(`alignment must be a power of two`);
+            const pad = (a - (secOff[sec] % a)) % a;
+            push("bytes", pad, { bytes: null, fill: 0 });
+            break;
+          }
+          case ".org": {
+            const v = evalExpr(args[0] || "", constLookup, secOff[sec]);
+            const off = v - (sec === "text" ? textBase : 0);
+            if (sec === "data" && !secOrg.data) secOrg.dataAbs = v;
+            if (sec === "text") {
+              if (off < secOff.text) throw new AsmError(`.org 0x${v.toString(16)} moves backwards`);
+              push("bytes", off - secOff.text, { bytes: null, fill: 0 });
+            } else {
+              throw new AsmError(".org is only supported in .text (use .space in .data)");
+            }
+            break;
+          }
+          default: throw new AsmError(`unknown directive ${op}`);
+        }
+      } else {
+        if (secOff[sec] % 4) warn(ln, "instruction is not word-aligned (add .align 2 before it)");
+        push("inst", 4 * instSize(op, args, constLookup));
+      }
+    } catch (e) {
+      if (e instanceof AsmError) err(ln, e.message); else throw e;
+    }
+    function alignWarn(n) { // auto-align .word/.half (like RARS); labels sitting at this spot move with it
+      const cur = secOff[sec], pad = (n - (cur % n)) % n;
+      if (!pad) return;
+      for (const v of labels.values()) if (v.sec === sec && v.off === cur) v.off += pad;
+      for (const l of locals) if (l.sec === sec && l.off === cur) l.off += pad;
+      items.push({ ln, sec, off: cur, size: pad, kind: "bytes", bytes: null, fill: 0, op, args: [] });
+      secOff[sec] += pad;
+    }
+  }
+
+  // ---------- layout
+  const textSize = secOff.text;
+  const dataBase = opts.dataBase ?? (((textBase + textSize + 15) & ~15) >>> 0);
+  const base = { text: textBase, data: dataBase };
+  const symbols = new Map();
+  for (const [k, v] of consts) symbols.set(k, v);
+  for (const [k, v] of labels) symbols.set(k, (base[v.sec] + v.off) >>> 0);
+  const symLine = new Map([...labels].map(([k, v]) => [k, v.ln]));
+
+  // ---------- pass 2: encode
+  const textBytes = new Uint8Array(textSize);
+  const dataBytes = new Uint8Array(secOff.data);
+  const buf = { text: textBytes, data: dataBytes };
+  const addrToLine = new Map();
+  const lineToAddr = new Map();
+  const listing = [];
+  items.forEach((it, idx) => {
+    const addr = (base[it.sec] + it.off) >>> 0;
+    if (it.kind === "inst" || it.size) { if (!lineToAddr.has(it.ln)) lineToAddr.set(it.ln, addr); }
+    const lookup = (n) => {
+      if (/^\d+[bf]$/.test(n)) {
+        const name = n.slice(0, -1);
+        if (n.endsWith("b")) { for (let j = locals.length - 1; j >= 0; j--) if (locals[j].name === name && locals[j].idx <= idx) return (base[locals[j].sec] + locals[j].off) >>> 0; }
+        else { for (const l of locals) if (l.name === name && l.idx > idx) return (base[l.sec] + l.off) >>> 0; }
+        return undefined;
+      }
+      return symbols.get(n);
+    };
+    const b = buf[it.sec];
+    const put = (off, val, w) => { for (let k = 0; k < w; k++) b[off + k] = (val >>> (8 * k)) & 0xff; };
+    try {
+      if (it.kind === "inst") {
+        const words = encodeInst(it.op, it.args, addr, lookup, it.size / 4);
+        if (words.length * 4 !== it.size) throw new AsmError(`internal size mismatch for ${it.op}`);
+        words.forEach((w, k) => { put(it.off + 4 * k, w, 4); addrToLine.set(addr + 4 * k, it.ln); listing.push({ addr: addr + 4 * k, word: w, ln: it.ln }); });
+      } else if (it.kind === "data") {
+        it.args.forEach((a, k) => {
+          const v = evalExpr(a, lookup, addr + k * it.width);
+          const lim = 2 ** (8 * it.width);
+          if (it.width < 4 && (v < -(lim / 2) || v >= lim)) warn(it.ln, `value ${v} doesn't fit in ${8 * it.width} bits (truncated)`);
+          put(it.off + k * it.width, v, it.width);
+        });
+        for (let k = 0; k < it.size; k += 4) addrToLine.set(addr + k, it.ln);
+      } else if (it.kind === "bytes") {
+        if (it.bytes) b.set(it.bytes, it.off); else if (it.fill) b.fill(it.fill, it.off, it.off + it.size);
+      }
+    } catch (e) {
+      if (e instanceof AsmError) err(it.ln, e.message); else throw e;
+    }
+  });
+
+  if (!errors.length && textSize === 0) warnings.push({ line: 1, message: "no instructions in .text", severity: "warning" });
+  let entry = textBase;
+  for (const n of ["_start", "main", "start"]) if (labels.has(n) && labels.get(n).sec === "text") { entry = symbols.get(n); break; }
+
+  return {
+    ok: errors.length === 0, errors: errors.sort((a, b) => a.line - b.line), warnings,
+    segments: [{ addr: textBase, bytes: textBytes, name: "text" }, { addr: dataBase, bytes: dataBytes, name: "data" }],
+    symbols, symLine, addrToLine, lineToAddr, listing, entry,
+    textRange: [textBase, textBase + textSize], dataRange: [dataBase, dataBase + secOff.data],
+  };
+}
+
+const isMemOperand = (a) => /\)\s*$/.test(a || "");
+
+function instSize(op, args, constLookup) {
+  if (!MNEMONICS.includes(op)) throw new AsmError(`unknown instruction "${op}"`);
+  if (op === "li") {
+    if (args.length !== 2) throw new AsmError("li needs: rd, value");
+    let v; try { v = evalExpr(args[1], constLookup, 0); } catch (e) { return 2; }
+    return v >= -2048 && v <= 2047 ? 1 : 2;
+  }
+  if (op === "la") return 2;
+  if ((op in LOAD) && args.length === 2 && !isMemOperand(args[1])) return 2;    // lw rd, symbol
+  if ((op in STORE) && args.length === 3) return 2;                            // sw rs, symbol, rt
+  return 1;
+}
+
+function reg(a, what = "register") {
+  const r = regNum((a || "").trim());
+  if (r < 0) throw new AsmError(a ? `"${a}" is not a register` : `missing ${what}`);
+  return r;
+}
+function nargs(op, args, n, form) { if (args.length !== n) throw new AsmError(`${op} expects ${form}`); }
+function imm12(v, what = "immediate") { if (v < -2048 || v > 2047) throw new AsmError(`${what} ${v} doesn't fit in 12 bits (-2048..2047)`); return v; }
+function memOperand(a, lookup, pc) {
+  const m = /^(.*)\(\s*([\w$]+)\s*\)\s*$/.exec(a.trim());
+  if (!m) throw new AsmError(`expected offset(register), got "${a}"`);
+  return [m[1].trim() ? evalExpr(m[1], lookup, pc) : 0, reg(m[2])];
+}
+function csrNum(a, lookup) {
+  const n = CSRNAMES[a.trim().toLowerCase()];
+  if (n !== undefined) return n;
+  const v = evalExpr(a, lookup, 0);
+  if (v < 0 || v > 0xfff) throw new AsmError(`bad CSR ${a}`);
+  return v;
+}
+
+function encodeInst(op, a, pc, lookup, nwords) {
+  const ev = (x) => evalExpr(x, lookup, pc);
+  const off = (x, bits) => {
+    const t = ev(x) - pc;
+    const lim = 2 ** (bits - 1);
+    if (t < -lim || t >= lim) throw new AsmError(`target ${x} is out of range for ${op} (±${lim} bytes)`);
+    if (t & 1) throw new AsmError(`target ${x} is not 2-byte aligned`);
+    return t;
+  };
+  if (op in R) { nargs(op, a, 3, "rd, rs1, rs2"); const [f3, f7] = R[op]; return [encR(f7, reg(a[2]), reg(a[1]), f3, reg(a[0]), 0x33)]; }
+  if (op in IALU) { nargs(op, a, 3, "rd, rs1, imm"); return [encI(imm12(ev(a[2])), reg(a[1]), IALU[op], reg(a[0]), 0x13)]; }
+  if (op in SHI) {
+    nargs(op, a, 3, "rd, rs1, shamt"); const sh = ev(a[2]);
+    if (sh < 0 || sh > 31) throw new AsmError(`shift amount ${sh} must be 0..31`);
+    const [f3, f7] = SHI[op]; return [encR(f7, sh, reg(a[1]), f3, reg(a[0]), 0x13)];
+  }
+  if (op in LOAD) {
+    if (a.length === 2 && !isMemOperand(a[1])) { // lw rd, symbol
+      const rd = reg(a[0]); const [hi, lo] = hiLo(ev(a[1]) - pc);
+      return [encU(hi, rd, 0x17), encI(lo, rd, LOAD[op], rd, 0x03)];
+    }
+    nargs(op, a, 2, "rd, offset(rs1)"); const [o, rs1] = memOperand(a[1], lookup, pc);
+    return [encI(imm12(o, "offset"), rs1, LOAD[op], reg(a[0]), 0x03)];
+  }
+  if (op in STORE) {
+    if (a.length === 3) { // sw rs2, symbol, rt
+      const rt = reg(a[2]); const [hi, lo] = hiLo(ev(a[1]) - pc);
+      return [encU(hi, rt, 0x17), encS(lo, reg(a[0]), rt, STORE[op], 0x23)];
+    }
+    nargs(op, a, 2, "rs2, offset(rs1)"); const [o, rs1] = memOperand(a[1], lookup, pc);
+    return [encS(imm12(o, "offset"), reg(a[0]), rs1, STORE[op], 0x23)];
+  }
+  if (op in BR) { nargs(op, a, 3, "rs1, rs2, label"); return [encB(off(a[2], 13), reg(a[1]), reg(a[0]), BR[op])]; }
+  if (op in CSR) {
+    nargs(op, a, 3, "rd, csr, rs1/uimm");
+    const src = op.endsWith("i") ? ev(a[2]) : reg(a[2]);
+    if (op.endsWith("i") && (src < 0 || src > 31)) throw new AsmError("CSR immediate must be 0..31");
+    return [encI(csrNum(a[1], lookup), src, CSR[op], reg(a[0]), 0x73)];
+  }
+  switch (op) {
+    case "lui": case "auipc": {
+      nargs(op, a, 2, "rd, imm20"); const v = ev(a[1]);
+      if (v < -524288 || v > 0xfffff) throw new AsmError(`${op} immediate ${v} doesn't fit in 20 bits`);
+      return [encU(v, reg(a[0]), op === "lui" ? 0x37 : 0x17)];
+    }
+    case "jal":
+      if (a.length === 1) return [encJ(off(a[0], 21), 1)];
+      nargs(op, a, 2, "rd, label"); return [encJ(off(a[1], 21), reg(a[0]))];
+    case "jalr":
+      if (a.length === 1) return [encI(0, reg(a[0]), 0, 1, 0x67)];
+      if (a.length === 2) { const [o, rs1] = memOperand(a[1], lookup, pc); return [encI(imm12(o), rs1, 0, reg(a[0]), 0x67)]; }
+      nargs(op, a, 3, "rd, rs1, imm"); return [encI(imm12(ev(a[2])), reg(a[1]), 0, reg(a[0]), 0x67)];
+    case "ecall": return [0x00000073];
+    case "ebreak": return [0x00100073];
+    case "fence": return [0x0ff0000f];
+    // ---- pseudo
+    case "nop": return [0x00000013];
+    case "li": {
+      nargs(op, a, 2, "rd, value"); const rd = reg(a[0]); const v = ev(a[1]);
+      if (v < -(2 ** 31) || v > 0xffffffff) throw new AsmError(`li value ${v} doesn't fit in 32 bits`);
+      if (nwords === 1) return [encI(imm12(v), 0, 0, rd, 0x13)];
+      const [hi, lo] = hiLo(v);
+      return [encU(hi, rd, 0x37), encI(lo, rd, 0, rd, 0x13)];
+    }
+    case "la": { nargs(op, a, 2, "rd, label"); const rd = reg(a[0]); const [hi, lo] = hiLo(ev(a[1]) - pc); return [encU(hi, rd, 0x17), encI(lo, rd, 0, rd, 0x13)]; }
+    case "mv": nargs(op, a, 2, "rd, rs"); return [encI(0, reg(a[1]), 0, reg(a[0]), 0x13)];
+    case "not": nargs(op, a, 2, "rd, rs"); return [encI(-1, reg(a[1]), 4, reg(a[0]), 0x13)];
+    case "neg": nargs(op, a, 2, "rd, rs"); return [encR(32, reg(a[1]), 0, 0, reg(a[0]), 0x33)];
+    case "seqz": nargs(op, a, 2, "rd, rs"); return [encI(1, reg(a[1]), 3, reg(a[0]), 0x13)];
+    case "snez": nargs(op, a, 2, "rd, rs"); return [encR(0, reg(a[1]), 0, 3, reg(a[0]), 0x33)];
+    case "sltz": nargs(op, a, 2, "rd, rs"); return [encR(0, 0, reg(a[1]), 2, reg(a[0]), 0x33)];
+    case "sgtz": nargs(op, a, 2, "rd, rs"); return [encR(0, reg(a[1]), 0, 2, reg(a[0]), 0x33)];
+    case "beqz": nargs(op, a, 2, "rs, label"); return [encB(off(a[1], 13), 0, reg(a[0]), 0)];
+    case "bnez": nargs(op, a, 2, "rs, label"); return [encB(off(a[1], 13), 0, reg(a[0]), 1)];
+    case "blez": nargs(op, a, 2, "rs, label"); return [encB(off(a[1], 13), reg(a[0]), 0, 5)];
+    case "bgez": nargs(op, a, 2, "rs, label"); return [encB(off(a[1], 13), 0, reg(a[0]), 5)];
+    case "bltz": nargs(op, a, 2, "rs, label"); return [encB(off(a[1], 13), 0, reg(a[0]), 4)];
+    case "bgtz": nargs(op, a, 2, "rs, label"); return [encB(off(a[1], 13), reg(a[0]), 0, 4)];
+    case "bgt": nargs(op, a, 3, "rs1, rs2, label"); return [encB(off(a[2], 13), reg(a[0]), reg(a[1]), 4)];
+    case "ble": nargs(op, a, 3, "rs1, rs2, label"); return [encB(off(a[2], 13), reg(a[0]), reg(a[1]), 5)];
+    case "bgtu": nargs(op, a, 3, "rs1, rs2, label"); return [encB(off(a[2], 13), reg(a[0]), reg(a[1]), 6)];
+    case "bleu": nargs(op, a, 3, "rs1, rs2, label"); return [encB(off(a[2], 13), reg(a[0]), reg(a[1]), 7)];
+    case "j": nargs(op, a, 1, "label"); return [encJ(off(a[0], 21), 0)];
+    case "jr": nargs(op, a, 1, "rs"); return [encI(0, reg(a[0]), 0, 0, 0x67)];
+    case "ret": nargs(op, a, 0, "no operands"); return [encI(0, 1, 0, 0, 0x67)];
+    case "call": nargs(op, a, 1, "label"); return [encJ(off(a[0], 21), 1)];
+    case "tail": nargs(op, a, 1, "label"); return [encJ(off(a[0], 21), 0)];
+    case "rdcycle": nargs(op, a, 1, "rd"); return [encI(0xC00, 0, 2, reg(a[0]), 0x73)];
+    case "rdtime": nargs(op, a, 1, "rd"); return [encI(0xC01, 0, 2, reg(a[0]), 0x73)];
+    case "rdinstret": nargs(op, a, 1, "rd"); return [encI(0xC02, 0, 2, reg(a[0]), 0x73)];
+    case "csrr": nargs(op, a, 2, "rd, csr"); return [encI(csrNum(a[1], lookup), 0, 2, reg(a[0]), 0x73)];
+    case "csrw": nargs(op, a, 2, "csr, rs"); return [encI(csrNum(a[0], lookup), reg(a[1]), 1, 0, 0x73)];
+    case "csrs": nargs(op, a, 2, "csr, rs"); return [encI(csrNum(a[0], lookup), reg(a[1]), 2, 0, 0x73)];
+    case "csrc": nargs(op, a, 2, "csr, rs"); return [encI(csrNum(a[0], lookup), reg(a[1]), 3, 0, 0x73)];
+  }
+  throw new AsmError(`unknown instruction "${op}"`);
+}
+
+/* ------------------------------------------------------------------ decode / disassemble */
+const sx = (v, bits) => (v << (32 - bits)) >> (32 - bits);
+function decode(w) {
+  w = w >>> 0;
+  const op = w & 0x7f, rd = (w >> 7) & 31, f3 = (w >> 12) & 7, rs1 = (w >> 15) & 31, rs2 = (w >> 20) & 31, f7 = w >>> 25;
+  const iImm = w >> 20;
+  const sImm = ((w >> 25) << 5) | ((w >> 7) & 31);
+  const bImm = sx((((w >>> 31) & 1) << 12) | (((w >> 7) & 1) << 11) | (((w >> 25) & 0x3f) << 5) | (((w >> 8) & 0xf) << 1), 13);
+  const uImm = w & 0xfffff000;
+  const jImm = sx((((w >>> 31) & 1) << 20) | (((w >> 12) & 0xff) << 12) | (((w >> 20) & 1) << 11) | (((w >> 21) & 0x3ff) << 1), 21);
+  return { w, op, rd, f3, rs1, rs2, f7, iImm, sImm, bImm, uImm, jImm };
+}
+
+function disasm(w, pc, opts = {}) {
+  const d = decode(w);
+  const rn = (r) => opts.xnames ? "x" + r : ABI[r];
+  const sym = opts.symbolAt || (() => null);
+  const tgt = (t) => { t = t >>> 0; const s = sym(t); return s ? s : "0x" + t.toString(16); };
+  const { op, rd, f3, rs1, rs2, f7, iImm } = d;
+  const find = (tbl, pred) => Object.keys(tbl).find(pred);
+  switch (op) {
+    case 0x33: { const n = find(R, k => R[k][0] === f3 && R[k][1] === f7); if (!n) break;
+      if (n === "sub" && rs1 === 0) return `neg ${rn(rd)}, ${rn(rs2)}`;
+      return `${n} ${rn(rd)}, ${rn(rs1)}, ${rn(rs2)}`; }
+    case 0x13: {
+      if (f3 === 1 || f3 === 5) { const n = find(SHI, k => SHI[k][0] === f3 && SHI[k][1] === f7); if (!n) break; return `${n} ${rn(rd)}, ${rn(rs1)}, ${rs2}`; }
+      const n = find(IALU, k => IALU[k] === f3);
+      if (n === "addi" && rd === 0 && rs1 === 0 && iImm === 0) return "nop";
+      if (n === "addi" && rs1 === 0) return `li ${rn(rd)}, ${iImm}`;
+      if (n === "addi" && iImm === 0) return `mv ${rn(rd)}, ${rn(rs1)}`;
+      if (n === "xori" && iImm === -1) return `not ${rn(rd)}, ${rn(rs1)}`;
+      return `${n} ${rn(rd)}, ${rn(rs1)}, ${iImm}`; }
+    case 0x03: { const n = find(LOAD, k => LOAD[k] === f3); if (!n) break; return `${n} ${rn(rd)}, ${iImm}(${rn(rs1)})`; }
+    case 0x23: { const n = find(STORE, k => STORE[k] === f3); if (!n) break; return `${n} ${rn(rs2)}, ${d.sImm}(${rn(rs1)})`; }
+    case 0x63: { const n = find(BR, k => BR[k] === f3); if (!n) break; const t = tgt(pc + d.bImm);
+      if (rs2 === 0 && (n === "beq" || n === "bne")) return `${n}z ${rn(rs1)}, ${t}`;
+      return `${n} ${rn(rs1)}, ${rn(rs2)}, ${t}`; }
+    case 0x37: return `lui ${rn(rd)}, 0x${(d.uImm >>> 12).toString(16)}`;
+    case 0x17: return `auipc ${rn(rd)}, 0x${(d.uImm >>> 12).toString(16)}`;
+    case 0x6f: { const t = tgt(pc + d.jImm);
+      if (rd === 0) return d.jImm === 0 ? `j . (halt loop)` : `j ${t}`;
+      if (rd === 1) return `jal ${t}`;
+      return `jal ${rn(rd)}, ${t}`; }
+    case 0x67: if (f3) break;
+      if (rd === 0 && rs1 === 1 && iImm === 0) return "ret";
+      if (rd === 0 && iImm === 0) return `jr ${rn(rs1)}`;
+      return `jalr ${rn(rd)}, ${iImm}(${rn(rs1)})`;
+    case 0x73:
+      if (w === 0x73) return "ecall";
+      if (w === 0x00100073) return "ebreak";
+      if (f3) { const n = find(CSR, k => CSR[k] === f3); const csr = (w >>> 20) & 0xfff; const cn = CSRBYNUM[csr] || "0x" + csr.toString(16);
+        if (n === "csrrs" && rs1 === 0) return `csrr ${rn(rd)}, ${cn}`;
+        return `${n} ${rn(rd)}, ${cn}, ${f3 >= 5 ? rs1 : rn(rs1)}`; }
+      break;
+    case 0x0f: return "fence";
+  }
+  return `.word 0x${(w >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+/* ------------------------------------------------------------------ machine */
+const SYSCALLS = {
+  1: "print_int(a0)", 4: "print_string(a0)", 5: "read_int → a0", 8: "read_string(a0 buf, a1 len)", 10: "exit",
+  11: "print_char(a0)", 12: "read_char → a0", 34: "print_hex(a0)", 35: "print_bin(a0)", 36: "print_unsigned(a0)",
+  93: "exit(a0)", 64: "write(a0 fd, a1 buf, a2 len)", 63: "read(a0 fd, a1 buf, a2 len)",
+};
+
+class Machine {
+  constructor(opts = {}) {
+    this.memSize = opts.memSize || 1 << 20;
+    this.mem = new Uint8Array(this.memSize);
+    this.x = new Int32Array(32);
+    this.historyCap = opts.historyCap || 200000;
+    this.output = opts.output || (() => {});
+    this.reset();
+  }
+  reset(keepMem = false) {
+    if (!keepMem) this.mem.fill(0);
+    this.x.fill(0);
+    this.pc = 0;
+    this.x[2] = this.memSize;              // sp = top of memory (stack grows down)
+    this.cycles = 0;
+    this.status = "ready";                 // ready | running | paused | halted | fault | input
+    this.message = "";
+    this.exitCode = null;
+    this.hist = [];                        // undo records
+    this.histDropped = 0;
+    this.frames = [];                      // call stack for ABI checks
+    this.abiWarnings = [];
+    this.csr = new Map();
+    this.pendingInput = null;
+    this.lastWrite = null;
+    this.memWrites = new Map();            // addr -> cycle of last write (for highlight)
+  }
+  load(asm) {
+    this.reset();
+    for (const s of asm.segments) {
+      if (!s.bytes.length) continue;
+      if (s.addr + s.bytes.length > this.memSize) throw new Error(`${s.name} segment (0x${s.addr.toString(16)}+${s.bytes.length}) doesn't fit in ${this.memSize >> 10} KiB of memory`);
+      this.mem.set(s.bytes, s.addr);
+    }
+    this.pc = asm.entry >>> 0;
+    this.program = asm;
+  }
+  loadBinary(bytes, addr) {
+    this.reset();
+    if (addr + bytes.length > this.memSize) throw new Error("file doesn't fit in memory");
+    this.mem.set(bytes, addr); this.pc = addr; this.program = null;
+  }
+  // ---- memory
+  checkAddr(a, n, write) {
+    if (a < 0 || a + n > this.memSize) throw new Fault(`${write ? "store to" : "load from"} 0x${(a >>> 0).toString(16)} is outside memory (0..0x${this.memSize.toString(16)})`);
+    if (a % n) throw new Fault(`misaligned ${n * 8}-bit ${write ? "store to" : "load from"} 0x${a.toString(16)} (address must be a multiple of ${n})`);
+  }
+  read(a, n, signed) {
+    a = a >>> 0; this.checkAddr(a, n, false);
+    const m = this.mem;
+    if (n === 1) return signed ? (m[a] << 24) >> 24 : m[a];
+    if (n === 2) { const v = m[a] | (m[a + 1] << 8); return signed ? (v << 16) >> 16 : v; }
+    return m[a] | (m[a + 1] << 8) | (m[a + 2] << 16) | (m[a + 3] << 24);
+  }
+  peek32(a) { a = a >>> 0; if (a + 4 > this.memSize) return 0; const m = this.mem; return (m[a] | (m[a + 1] << 8) | (m[a + 2] << 16) | (m[a + 3] << 24)) >>> 0; }
+  write(a, n, v, rec) {
+    a = a >>> 0; this.checkAddr(a, n, true);
+    if (rec) rec.mem = [a, n, this.read(a, n, false)];
+    for (let k = 0; k < n; k++) this.mem[a + k] = (v >>> (8 * k)) & 0xff;
+    this.memWrites.set(a & ~3, this.cycles);
+    this.lastWrite = [a, n];
+  }
+  setReg(r, v, rec) { if (r) { rec.rd = r; rec.old = this.x[r]; this.x[r] = v | 0; } }
+  readCSR(n) {
+    switch (n) { case 0xC00: case 0xC02: case 0xB00: case 0xB02: case 0xC01: return this.cycles | 0;
+      case 0xC80: case 0xC81: case 0xC82: return Math.floor(this.cycles / 2 ** 32) | 0; case 0xF14: return 0; case 0x301: return 0x40001100; }
+    return this.csr.get(n) | 0;
+  }
+  // ---- execution
+  step() {
+    if (this.status === "halted" || this.status === "fault") return false;
+    if (this.status === "input") return false;
+    const pc = this.pc >>> 0;
+    const rec = { pc, rd: 0, old: 0, mem: null, frame: null, cyc: this.cycles };
+    try {
+      if (pc % 4) throw new Fault(`pc 0x${pc.toString(16)} is not word-aligned`);
+      if (pc + 4 > this.memSize) throw new Fault(`pc 0x${pc.toString(16)} is outside memory`);
+      const w = this.peek32(pc);
+      if (w === 0) throw new Fault(`illegal instruction 0x00000000 at 0x${pc.toString(16)} — the program ran past the end of its code. End it with an exit ecall (li a7, 10; ecall) or a "j ." loop.`);
+      const d = decode(w);
+      const x = this.x;
+      let next = (pc + 4) >>> 0;
+      const r1 = x[d.rs1], r2 = x[d.rs2];
+      switch (d.op) {
+        case 0x33: {
+          let v;
+          if (d.f7 === 1) {
+            switch (d.f3) {
+              case 0: v = Math.imul(r1, r2); break;
+              case 1: v = Number((BigInt(r1) * BigInt(r2)) >> 32n); break;
+              case 2: v = Number((BigInt(r1) * BigInt(r2 >>> 0)) >> 32n); break;
+              case 3: v = Number((BigInt(r1 >>> 0) * BigInt(r2 >>> 0)) >> 32n); break;
+              case 4: v = r2 === 0 ? -1 : (r1 === -2147483648 && r2 === -1) ? r1 : Math.trunc(r1 / r2); break;
+              case 5: v = r2 === 0 ? -1 : Math.floor((r1 >>> 0) / (r2 >>> 0)); break;
+              case 6: v = r2 === 0 ? r1 : (r1 === -2147483648 && r2 === -1) ? 0 : r1 % r2; break;
+              case 7: v = r2 === 0 ? r1 : (r1 >>> 0) % (r2 >>> 0); break;
+            }
+          } else if (d.f7 === 0 || d.f7 === 32) {
+            switch (d.f3) {
+              case 0: v = d.f7 ? r1 - r2 : r1 + r2; break;
+              case 1: v = r1 << (r2 & 31); break;
+              case 2: v = r1 < r2 ? 1 : 0; break;
+              case 3: v = (r1 >>> 0) < (r2 >>> 0) ? 1 : 0; break;
+              case 4: v = r1 ^ r2; break;
+              case 5: v = d.f7 ? r1 >> (r2 & 31) : r1 >>> (r2 & 31); break;
+              case 6: v = r1 | r2; break;
+              case 7: v = r1 & r2; break;
+            }
+            if ((d.f7 === 32) && d.f3 !== 0 && d.f3 !== 5) v = undefined;
+          }
+          if (v === undefined) throw illegal(w, pc);
+          this.setReg(d.rd, v, rec); break;
+        }
+        case 0x13: {
+          const im = d.iImm; let v;
+          switch (d.f3) {
+            case 0: v = r1 + im; break; case 2: v = r1 < im ? 1 : 0; break; case 3: v = (r1 >>> 0) < (im >>> 0) ? 1 : 0; break;
+            case 4: v = r1 ^ im; break; case 6: v = r1 | im; break; case 7: v = r1 & im; break;
+            case 1: if (d.f7) throw illegal(w, pc); v = r1 << d.rs2; break;
+            case 5: if (d.f7 === 32) v = r1 >> d.rs2; else if (d.f7 === 0) v = r1 >>> d.rs2; else throw illegal(w, pc); break;
+          }
+          this.setReg(d.rd, v, rec); break;
+        }
+        case 0x03: {
+          const a = (r1 + d.iImm) >>> 0; let v;
+          switch (d.f3) { case 0: v = this.read(a, 1, true); break; case 1: v = this.read(a, 2, true); break; case 2: v = this.read(a, 4); break;
+            case 4: v = this.read(a, 1, false); break; case 5: v = this.read(a, 2, false); break; default: throw illegal(w, pc); }
+          this.setReg(d.rd, v, rec); break;
+        }
+        case 0x23: {
+          const a = (r1 + d.sImm) >>> 0; const n = [1, 2, 4][d.f3]; if (!n) throw illegal(w, pc);
+          this.write(a, n, r2, rec); break;
+        }
+        case 0x63: {
+          let t;
+          switch (d.f3) { case 0: t = r1 === r2; break; case 1: t = r1 !== r2; break; case 4: t = r1 < r2; break; case 5: t = r1 >= r2; break;
+            case 6: t = (r1 >>> 0) < (r2 >>> 0); break; case 7: t = (r1 >>> 0) >= (r2 >>> 0); break; default: throw illegal(w, pc); }
+          if (t) next = (pc + d.bImm) >>> 0;
+          break;
+        }
+        case 0x37: this.setReg(d.rd, d.uImm, rec); break;
+        case 0x17: this.setReg(d.rd, pc + d.uImm, rec); break;
+        case 0x6f: {
+          next = (pc + d.jImm) >>> 0;
+          if (d.rd === 0 && d.jImm === 0) { this.halt("Program finished (reached a \"j .\" loop)."); this.cycles++; return false; }
+          this.setReg(d.rd, pc + 4, rec);
+          if (d.rd === 1) this.pushFrame(next, pc, rec);
+          break;
+        }
+        case 0x67: {
+          if (d.f3) throw illegal(w, pc);
+          next = ((r1 + d.iImm) & ~1) >>> 0;
+          this.setReg(d.rd, pc + 4, rec);
+          if (d.rd === 1) this.pushFrame(next, pc, rec);
+          else if (d.rd === 0 && d.rs1 === 1) this.popFrame(next, pc, rec);
+          break;
+        }
+        case 0x0f: break;
+        case 0x73: {
+          if (w === 0x73) { const r = this.ecall(rec); if (r === "wait") return false; if (r === "exit") { this.cycles++; this.hist.push(rec); return false; } }
+          else if (w === 0x00100073) { this.pc = next; this.cycles++; this.hist.push(rec); this.status = "paused"; this.message = `ebreak at 0x${pc.toString(16)}`; return false; }
+          else {
+            const csr = (w >>> 20) & 0xfff; const old = this.readCSR(csr); const src = d.f3 >= 5 ? d.rs1 : r1;
+            let nv = old;
+            switch (d.f3 & 3) { case 1: nv = src; break; case 2: nv = old | src; break; case 3: nv = old & ~src; break; default: throw illegal(w, pc); }
+            const writes = (d.f3 & 3) === 1 || d.rs1 !== 0;
+            if (writes) { if ((csr >> 10) === 3) throw new Fault(`CSR ${CSRBYNUM[csr] || csr} is read-only`); rec.csr = [csr, this.csr.get(csr)]; this.csr.set(csr, nv | 0); }
+            this.setReg(d.rd, old, rec);
+          }
+          break;
+        }
+        default: throw illegal(w, pc);
+      }
+      this.pc = next;
+      this.cycles++;
+      this.hist.push(rec);
+      if (this.hist.length > this.historyCap) { const drop = this.hist.length - this.historyCap + 10000; this.hist.splice(0, drop); this.histDropped += drop; }
+      return true;
+    } catch (e) {
+      if (e instanceof Fault) { this.status = "fault"; this.message = e.message; return false; }
+      throw e;
+    }
+  }
+  halt(msg, code = 0) { this.status = "halted"; this.message = msg; this.exitCode = code; }
+  pushFrame(target, pc, rec) {
+    const saved = [];
+    for (let r = 0; r < 32; r++) if (REG_SAVER[r] === "callee") saved.push(this.x[r]);
+    this.frames.push({ target, callPc: pc, ret: (pc + 4) >>> 0, saved, cyc: this.cycles });
+    rec.frame = { push: true };
+    if (this.frames.length > 10000) this.frames.shift();
+  }
+  popFrame(target, pc, rec) {
+    const i = this.frames.map(f => f.ret).lastIndexOf(target);
+    if (i < 0) return;
+    const f = this.frames[i];
+    const popped = this.frames.splice(i);
+    rec.frame = { popped };
+    const changed = [];
+    let k = 0;
+    for (let r = 0; r < 32; r++) if (REG_SAVER[r] === "callee") { if (this.x[r] !== f.saved[k]) changed.push(r); k++; }
+    if (changed.length) {
+      const fn = this.program ? (this.symbolAt(f.target) || "0x" + f.target.toString(16)) : "0x" + f.target.toString(16);
+      const msg = `${fn} returned without restoring ${changed.map(r => ABI[r]).join(", ")} (callee-saved — save them on the stack first)`;
+      this.abiWarnings.push({ cyc: this.cycles, pc, msg, regs: changed });
+      rec.abiWarn = true;
+    }
+  }
+  symbolAt(a) {
+    if (!this.program) return null;
+    if (!this._symRev) this._symRev = null;
+    if (!this._symRevFor || this._symRevFor !== this.program) {
+      this._symRevFor = this.program; this._symRev = new Map();
+      for (const [k, v] of this.program.symbols) if (this.program.symLine.has(k) && !this._symRev.has(v)) this._symRev.set(v, k);
+    }
+    return this._symRev.get(a >>> 0) || null;
+  }
+  readString(a, max = 4096) {
+    let s = ""; const bytes = [];
+    for (let i = 0; i < max; i++) { const b = this.read(a + i, 1, false); if (!b) break; bytes.push(b); }
+    try { s = new TextDecoder().decode(new Uint8Array(bytes)); } catch (e) { s = String.fromCharCode(...bytes); }
+    return s;
+  }
+  ecall(rec) {
+    const a7 = this.x[17], a0 = this.x[10];
+    const out = (s) => this.output(s);
+    switch (a7) {
+      case 1: out(String(a0)); break;
+      case 4: out(this.readString(a0 >>> 0)); break;
+      case 11: out(String.fromCharCode(a0 & 0xff)); break;
+      case 34: out("0x" + (a0 >>> 0).toString(16).padStart(8, "0")); break;
+      case 35: out((a0 >>> 0).toString(2).padStart(32, "0")); break;
+      case 36: out(String(a0 >>> 0)); break;
+      case 64: { const n = this.x[12] >>> 0; let s = ""; for (let i = 0; i < n && i < 65536; i++) s += String.fromCharCode(this.read(this.x[11] + i, 1, false)); out(s); this.setReg(10, n, rec); break; }
+      case 10: this.pc = (this.pc + 4) >>> 0; this.halt("Program exited (ecall 10).", 0); return "exit";
+      case 93: this.pc = (this.pc + 4) >>> 0; this.halt(`Program exited with code ${a0} (ecall 93).`, a0); return "exit";
+      case 5: case 8: case 12: case 63:
+        if (this.inputValue === undefined) { this.status = "input"; this.pendingInput = a7; return "wait"; }
+        { const v = this.inputValue; this.inputValue = undefined; this.pendingInput = null;
+          if (a7 === 5) { const n = parseInt(v, 10); this.setReg(10, isNaN(n) ? 0 : n, rec); }
+          else if (a7 === 12) this.setReg(10, v.length ? v.charCodeAt(0) : 10, rec);
+          else {
+            const buf = (a7 === 8 ? a0 : this.x[11]) >>> 0, len = (a7 === 8 ? this.x[11] : this.x[12]) >>> 0;
+            const bytes = new TextEncoder().encode(a7 === 8 ? v + "\n" : v + "\n");
+            const n = Math.min(bytes.length, a7 === 8 ? Math.max(0, len - 1) : len);
+            const writes = [];
+            for (let i = 0; i < n; i++) { writes.push([buf + i, this.read(buf + i, 1, false)]); this.mem[buf + i] = bytes[i]; }
+            if (a7 === 8 && len) { writes.push([buf + n, this.read(buf + n, 1, false)]); this.mem[buf + n] = 0; }
+            rec.memBlock = writes;
+            if (a7 === 63) this.setReg(10, n, rec);
+          }
+        }
+        break;
+      default:
+        this.status = "paused";
+        this.message = `Unknown ecall service a7=${a7}. Supported: ${Object.entries(SYSCALLS).map(([k, v]) => k + " " + v).join(", ")}`;
+        this.pc = (this.pc + 4) >>> 0; this.cycles++; this.hist.push(rec);
+        return "wait";
+    }
+    return "ok";
+  }
+  provideInput(text) { this.inputValue = text; if (this.status === "input") this.status = "paused"; }
+  stepBack() {
+    const rec = this.hist.pop();
+    if (!rec) return false;
+    if (rec.rd) this.x[rec.rd] = rec.old;
+    if (rec.mem) { const [a, n, v] = rec.mem; for (let k = 0; k < n; k++) this.mem[a + k] = (v >>> (8 * k)) & 0xff; }
+    if (rec.memBlock) for (let i = rec.memBlock.length - 1; i >= 0; i--) this.mem[rec.memBlock[i][0]] = rec.memBlock[i][1];
+    if (rec.csr) { if (rec.csr[1] === undefined) this.csr.delete(rec.csr[0]); else this.csr.set(rec.csr[0], rec.csr[1]); }
+    if (rec.frame) { if (rec.frame.push) this.frames.pop(); else if (rec.frame.popped) this.frames.push(...rec.frame.popped); }
+    if (rec.abiWarn) this.abiWarnings.pop();
+    this.pc = rec.pc;
+    this.cycles = rec.cyc;
+    this.status = "paused"; this.message = ""; this.exitCode = null; this.pendingInput = null;
+    return true;
+  }
+  // Value history for one register: [{cyc, pc, old, value}] oldest first (from undo log)
+  regHistory(r, limit = 500) {
+    const out = [];
+    for (let i = this.hist.length - 1; i >= 0 && out.length < limit; i--) {
+      const h = this.hist[i];
+      if (h.rd === r) out.push({ cyc: h.cyc, pc: h.pc, old: h.old, value: 0 });
+    }
+    let cur = this.x[r];               // value after a write = old value of the next write (or the current value)
+    for (const e of out) { e.value = cur; cur = e.old; }
+    return out.reverse();
+  }
+}
+class Fault extends Error {}
+const illegal = (w, pc) => new Fault(`illegal instruction 0x${(w >>> 0).toString(16).padStart(8, "0")} at 0x${pc.toString(16)}`);
+
+/* ------------------------------------------------------------------ hex / kmd loaders */
+function parseHexText(text) { // one hex word per line (Bennett/Verilog style), optional @addr lines
+  const words = []; let addr = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const t = raw.replace(/\/\/.*|#.*/, "").trim(); if (!t) continue;
+    for (const tok of t.split(/\s+/)) {
+      if (tok[0] === "@") { addr = parseInt(tok.slice(1), 16); continue; }
+      const v = parseInt(tok.replace(/^0x/i, ""), 16); if (isNaN(v)) throw new Error(`bad hex value "${tok}"`);
+      words.push(v >>> 0);
+    }
+  }
+  const b = new Uint8Array(words.length * 4);
+  words.forEach((w, i) => { for (let k = 0; k < 4; k++) b[i * 4 + k] = (w >>> (8 * k)) & 0xff; });
+  return { bytes: b, addr };
+}
+
+const api = { assemble, disasm, decode, Machine, ABI, REG_ROLE, REG_SAVER, regNum, MNEMONICS, PSEUDO, DIRECTIVES, DOC, SYSCALLS,
+  CSRNAMES, evalExpr, parseHexText, AsmError };
+if (typeof module !== "undefined" && module.exports) module.exports = api; else root.RV = api;
+})(typeof window !== "undefined" ? window : globalThis);

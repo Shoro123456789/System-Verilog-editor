@@ -10,6 +10,8 @@ but usable for any SystemVerilog project. Open a Questa/ModelSim project (`.mpf`
 - **Virtual lab board:** run `*_Board` designs live with the keypad, switches, displays and traffic lights,
   and step through MU0 programs
 - **FPGA timing** results from Vivado, or from your lab build logs
+- **RISC-V simulator** (COMP15111, Bennett-style): assemble and debug RV32IM programs with step-back,
+  register history, ABI names and calling-convention checks. Runs on Windows and Linux with nothing to install
 - **Updates itself** from this GitHub repo
 
 ---
@@ -212,6 +214,36 @@ keypad and displays: through DPI and a small C++ harness with Verilator, or thro
 (`tools/board-vpi/`, built by `.github/workflows/build-board-vpi.yml`) with Icarus. Your files aren't changed. The simulation is functional (no FPGA timing), and the
 UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colours for
 `Crossing_A`, and which end Digit0 sits at, are assumptions; each lamp is labelled with its bit.
+
+## RISC-V simulator (COMP15111)
+
+The **RISC-V** tab is a built-in assembler and debugger for RV32IM programs, similar to Bennett but
+running natively on Windows and Linux with no install. It works without opening a project.
+
+- **Assemble** (F7) a `.s` file. Errors and warnings are underlined as you type.
+- **Run** (F5), **step** (F11), **step over** a call (F10), **step out** (Shift+F10), and **step back**
+  (Shift+F11). Step back undoes one instruction at a time, including memory writes, for the last 200,000 instructions.
+- **Breakpoints:** click left of a line number, or press F9.
+- **Registers** use ABI names (`a0`, `sp`, `s1`…) or `x0`–`x31`, shown in hex, signed, unsigned, binary or char.
+  The register changed by the last instruction is highlighted.
+- **Register history:** click a register to see every value it held, a sparkline of how it changed, and
+  the instruction that wrote each value. Click a row to jump to that line.
+- **Calling-convention check:** on every `ret`, SV Studio checks that the function restored the
+  callee-saved registers (`s0`–`s11`, `sp`). If it didn't, you get a warning naming the function and the registers.
+- **Panes:** Trace (the last 300 instructions and what each changed), Memory (words or bytes; follow `sp`;
+  double-click to edit), Call stack, Code (disassembly), and Symbols.
+- **Hover** an instruction for what it does, a register for its role and current value, or a label for its address.
+- **Console I/O** through `ecall` with the RARS/Venus service numbers in `a7`: 1 print int, 4 print string,
+  11 print char, 34 print hex, 5 read int, 8 read string, 12 read char, 10 exit, 93 exit with code `a0`,
+  and 63/64 read/write.
+- **Assembler:** GNU-style syntax with labels, numeric local labels (`1:` / `1b` / `1f`), `.text`/`.data`, `.word`/`.half`/`.byte`,
+  `.asciz`/`.string`, `.space`, `.align`, `.equ`, `%hi`/`%lo`, and the usual pseudo-instructions
+  (`li`, `la`, `mv`, `call`, `ret`, `j`, `beqz`, `bgt`, `lw rd, label`…). Code starts at `0x0`, data follows it,
+  and `sp` starts at the top of memory (1 MiB by default).
+- **Open** `.hex`/`.txt` (one word per line), `.bin`, or `.kmd` images, then follow them in the Code tab.
+- **Where it differs from Bennett:** it doesn't connect to the lab FPGA boards. Bennett uses the
+  university's own assembler, so a directive that only Bennett supports may need changing. Check
+  marked work in Bennett.
 
 ## FPGA timing (Vivado)
 
