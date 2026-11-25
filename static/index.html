@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c5cff'/%3E%3Cpath d='M5 21h5V11h6v10h5V11h6' fill='none' stroke='white' stroke-width='2.6' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
-<script>window.SVS_TOKEN = "__SVS_TOKEN__";</script>
+<script>window.SVS_TOKEN = "__SVS_TOKEN__"; window.SVS_STATE = __SVS_STATE__;</script>
 </head>
 <body>
 <header class="topbar">
@@ -24,20 +24,20 @@
     <span class="lbl">Search files, modules, commands</span><kbd>Ctrl P</kbd>
   </button>
   <div class="spacer"></div>
-  <label class="field"><span>Simulator</span>
+  <label class="field sv-only"><span>Simulator</span>
     <select id="selBackend">
       <option value="questa">Questa</option>
       <option value="verilator">Verilator</option>
       <option value="icarus">Icarus</option>
     </select>
   </label>
-  <label class="field"><span>Top</span><select id="selTop"><option value="">—</option></select></label>
-  <label class="field"><span>Run for</span><input id="inpRun" value="-all" spellcheck="false" title="-all, or a time such as 500ns, 20us, 1ms"></label>
-  <button class="btn" id="btnCompile" title="Compile (F7)">
+  <label class="field sv-only"><span>Top</span><select id="selTop"><option value="">—</option></select></label>
+  <label class="field sv-only"><span>Run for</span><input id="inpRun" value="-all" spellcheck="false" title="-all, or a time such as 500ns, 20us, 1ms"></label>
+  <button class="btn sv-only" id="btnCompile" title="Compile (F7)">
     <svg viewBox="0 0 24 24"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg>Compile</button>
-  <button class="btn primary" id="btnRun" title="Compile + simulate (F5)">
+  <button class="btn primary sv-only" id="btnRun" title="Compile + simulate (F5)">
     <svg viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z" class="fill"/></svg>Simulate</button>
-  <button class="btn danger" id="btnStop" hidden>
+  <button class="btn danger sv-only" id="btnStop" hidden>
     <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" class="fill"/></svg>Stop</button>
   <button class="icon-btn" id="btnSettings" title="Settings">
     <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
@@ -261,7 +261,6 @@
           <button class="btn sm" id="rvNew" title="New program">New</button>
           <button class="btn sm" id="rvOpen" title="Open .s / .hex / .bin (Ctrl+O)">Open</button>
           <button class="btn sm" id="rvSave" title="Save (Ctrl+S)">Save</button>
-          <span class="rv-fname" id="rvFile">untitled.s</span>
         </div>
         <div class="rv-sep"></div>
         <button class="btn sm" id="rvAsm" title="Assemble and load (F7)"><svg viewBox="0 0 24 24"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg>Assemble</button>
@@ -284,8 +283,10 @@
       </div>
       <div class="rv-body">
         <div class="rv-left">
+          <div class="rv-tabbar" id="rvTabbar"></div>
           <div class="rv-editor" id="rvEditor"></div>
-          <div class="rv-console">
+          <div class="rv-hresizer" id="rvConResize" title="Drag to resize the console (double-click to reset)"></div>
+          <div class="rv-console" id="rvConsole">
             <div class="rv-panel-head"><span>Console</span><span class="muted small" id="rvConHint"></span><div class="spacer"></div>
               <button class="btn ghost sm" id="rvConClear">Clear</button></div>
             <div class="rv-con" id="rvCon"></div>
@@ -303,6 +304,7 @@
             <div class="rv-reggrid" id="rvRegs"></div>
             <div class="rv-legend"><span><i class="lg callee"></i>callee-saved (s0–s11, sp)</span><span><i class="lg arg"></i>arguments a0–a7</span><span><i class="lg tmp"></i>temporaries</span><span class="muted">click a register for its history</span></div>
           </div>
+          <div class="rv-hresizer" id="rvRegResize" title="Drag to resize (double-click to reset)"></div>
           <div class="rv-tabs" id="rvTabs">
             <button data-p="hist" class="active">History</button><button data-p="trace">Trace</button><button data-p="mem">Memory</button>
             <button data-p="stack">Call stack <span class="badge" id="rvAbiBadge" hidden></span></button><button data-p="code">Code</button><button data-p="sym">Symbols</button>

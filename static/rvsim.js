@@ -100,8 +100,10 @@ const h8 = (v) => "0x" + (v >>> 0).toString(16).padStart(8, "0");
 const hx = (v, n = 8) => (v >>> 0).toString(16).padStart(n, "0");
 
 const R = {
-  path: LS.get("rv.path", null),
+  path: null,
   dirty: false,
+  tabs: [],              // open programs; the active one's fields live on R itself
+  cur: null,
   asm: null,             // last assembly result
   asmText: null,         // source it was built from
   mode: LS.get("rv.mode", "bennett"),
@@ -122,7 +124,7 @@ const R = {
 el("#rvMem").value = String(LS.get("rv.mem", 1048576));
 el("#rvMode").value = R.mode;
 const makeMachine = () => new RV.Machine({ mode: R.mode, memSize: +el("#rvMem").value, output: (s) => conOut(s) });
-R.m = makeMachine();
+R.m = makeMachine();   // replaced per tab by restoreTabs()
 function applyMode() {
   el("#rvMemField").hidden = R.mode === "bennett";
   el("#rvConHint").textContent = R.mode === "bennett"
@@ -133,15 +135,16 @@ applyMode();
 
 /* ---------------------------------------------------------------- editor */
 const ed = SVEditor.createAsm(el("#rvEditor"), {
-  doc: LS.get("rv.draft", null) ?? EXAMPLE(),
+  doc: "",
   onChange: () => {
+    if (R.switching) return;
     if (!R.dirty) { R.dirty = true; renderFile(); }
-    clearTimeout(R.draftT); R.draftT = setTimeout(() => LS.set("rv.draft", ed.getDoc()), 400);
+    persistSoon();
     if (R.asm && ed.getDoc() !== R.asmText) setStatus("Source changed — press F7 to reassemble", "");
     clearTimeout(R.lintT); R.lintT = setTimeout(liveCheck, 500);
   },
   onSave: () => save(),
-  onBreakpoints: () => { syncBreakpoints(); LS.set("rv.bps", ed.breakpoints()); },
+  onBreakpoints: () => { syncBreakpoints(); persistSoon(); },
   hooks: {
     dialect: () => R.mode,
     regValue: (r) => R.loaded ? `${h8(R.m.x[r])}  =  ${R.m.x[r]}` : null,
@@ -151,7 +154,6 @@ const ed = SVEditor.createAsm(el("#rvEditor"), {
     },
   },
 });
-ed.setBreakpoints(LS.get("rv.bps", []));
 
 function liveCheck() {
   const r = RV.assemble(ed.getDoc(), { dialect: R.mode });
@@ -175,9 +177,140 @@ const sys = (t, cls = "sys") => { const box = el("#rvCon"); const last = box.las
 el("#rvConClear").onclick = () => { el("#rvCon").innerHTML = ""; };
 
 /* ---------------------------------------------------------------- file handling */
-const fname = () => R.path ? R.path.replace(/\\/g, "/").split("/").pop() : "untitled.s";
-function renderFile() { const f = el("#rvFile"); f.textContent = fname(); f.title = R.path || "Not saved yet"; f.classList.toggle("dirty", R.dirty); }
-renderFile();
+const fname = () => R.path ? R.path.replace(/\\/g, "/").split("/").pop() : (R.cur && R.cur.title) || "untitled.s";
+function renderFile() { renderTabs(); }
+
+/* ---------------------------------------------------------------- program tabs */
+// Each tab keeps its own source, undo history, breakpoints, mode, assembled program, machine
+// state and console. Tabs (including unsaved text) are saved in SV Studio's state folder.
+const TAB_FIELDS = ["path", "dirty", "asm", "asmText", "m", "loaded", "mode", "sel", "memBase", "bpAddrs", "kmdSyms", "resume", "prevRegs"];
+let tabSeq = 0;
+const tabName = (t) => t.path ? t.path.replace(/\\/g, "/").split("/").pop() : (t.title || "untitled.s");
+function blankTab(text, extra = {}) {
+  return { id: ++tabSeq, path: null, dirty: false, asm: null, asmText: null, m: null, loaded: false, mode: R.mode, sel: null, memBase: 0,
+    bpAddrs: new Set(), kmdSyms: null, resume: null, prevRegs: new Int32Array(32), state: ed.makeState(text), con: "", ...extra };
+}
+function stash() {
+  const t = R.cur; if (!t) return;
+  for (const f of TAB_FIELDS) t[f] = R[f];
+  t.state = ed.saveState(); t.con = el("#rvCon").innerHTML; t.inputShown = !el("#rvInputForm").hidden;
+}
+function unstash(t) {
+  for (const f of TAB_FIELDS) R[f] = t[f];
+  R.cur = t;
+  if (!R.m || R.m.mode !== (R.mode === "bennett" ? "bennett" : "generic")) R.m = makeMachine();
+  R.m.output = (x) => conOut(x);
+  R.switching = true; ed.loadState(t.state); R.switching = false;
+  el("#rvCon").innerHTML = t.con || "";
+  el("#rvMode").value = R.mode; applyMode();
+  el("#rvInputForm").hidden = !(t.inputShown && R.m.status === "input");
+  restoreStatus();
+}
+function restoreStatus() {
+  const st = R.m.status;
+  if (!R.loaded) setStatus(R.asm === null && R.asmText === null ? "Not assembled" : "Not assembled", "");
+  else if (st === "halted") setStatus("Finished", "ok");
+  else if (st === "fault") setStatus("Fault", "fail");
+  else if (st === "input") setStatus("Waiting for input", "running");
+  else if (R.m.cycles) setStatus("Paused", "");
+  else setStatus("Ready", "ok");
+}
+function switchTab(t) {
+  if (t === R.cur) return;
+  stop();
+  stash();
+  unstash(t);
+  renderTabs(); refresh(true); liveCheck(); persistSoon();
+  ed.focus();
+}
+function addTab(t, activate = true) {
+  const i = R.cur ? R.tabs.indexOf(R.cur) + 1 : R.tabs.length;
+  R.tabs.splice(i, 0, t);
+  if (activate) { stop(); stash(); unstash(t); renderTabs(); refresh(true); liveCheck(); persistSoon(); }
+  return t;
+}
+function closeTab(t) {
+  if (t.dirty || (t === R.cur && R.dirty)) { if (!confirm(`${tabName(t)} has unsaved changes. Close it and lose them?`)) return; }
+  const i = R.tabs.indexOf(t);
+  R.tabs.splice(i, 1);
+  if (t === R.cur) {
+    stop(); R.cur = null;
+    const next = R.tabs[i] || R.tabs[i - 1];
+    if (next) unstash(next); else { const nt = blankTab(NEW_DOC()); R.tabs.push(nt); unstash(nt); }
+    refresh(true); liveCheck();
+  }
+  renderTabs(); persistSoon();
+}
+// an untouched, unsaved tab can be replaced when opening a file
+const isScratch = (t) => !t.path && !(t === R.cur ? R.dirty : t.dirty);
+function renderTabs() {
+  const bar = el("#rvTabbar");
+  if (!bar) return;
+  bar.innerHTML = "";
+  for (const t of R.tabs) {
+    const dirty = t === R.cur ? R.dirty : t.dirty;
+    const d = document.createElement("div");
+    d.className = "rv-tab" + (t === R.cur ? " active" : "") + (dirty ? " dirty" : "");
+    d.title = (t.path || "Not saved yet") + (dirty ? " (unsaved changes)" : "");
+    d.innerHTML = `<span class="tn"></span><span class="tm">${(t === R.cur ? R.mode : t.mode) === "bennett" ? "" : "GNU"}</span><span class="x" title="Close">×</span>`;
+    d.querySelector(".tn").textContent = tabName(t);
+    d.onmousedown = (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t); } };
+    d.onclick = (e) => { if (e.target.classList.contains("x")) closeTab(t); else switchTab(t); };
+    bar.appendChild(d);
+  }
+  const add = document.createElement("button");
+  add.className = "rv-tab-add"; add.title = "New program"; add.textContent = "+";
+  add.onclick = () => newProgram();
+  bar.appendChild(add);
+  const act = bar.querySelector(".active"); if (act) act.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+function newProgram(text) {
+  const t = blankTab(text ?? NEW_DOC());
+  const n = R.tabs.filter(x => !x.path).length;
+  t.title = n ? `untitled-${n + 1}.s` : "untitled.s";
+  addTab(t);
+}
+let persistT = null;
+function persistSoon() { clearTimeout(persistT); persistT = setTimeout(persistNow, 600); }
+function persistNow() {
+  clearTimeout(persistT); persistT = null;
+  if (!R.cur) return;
+  const out = R.tabs.map(t => {
+    const live = t === R.cur;
+    const st = live ? ed.saveState() : t.state;
+    return { path: live ? R.path : t.path, title: t.title || null, dirty: live ? R.dirty : t.dirty, mode: live ? R.mode : t.mode,
+      text: st.doc.toString(), bps: ed.breakpointsOf(st) };
+  });
+  LS.set("rv.tabs", out);
+  LS.set("rv.active", R.tabs.indexOf(R.cur));
+}
+function restoreTabs() {
+  let saved = LS.get("rv.tabs", null);
+  if (!saved || !saved.length) {   // older versions kept a single draft
+    const draft = LS.get("rv.draft", null), path = LS.get("rv.path", null);
+    saved = [{ path, dirty: !!(draft && !path), mode: R.mode, text: draft ?? EXAMPLE(), bps: LS.get("rv.bps", []) }];
+  }
+  for (const s of saved) {
+    const t = blankTab(s.text || "", { path: s.path || null, dirty: !!s.dirty, mode: s.mode || R.mode, title: s.title || null });
+    if (s.bps && s.bps.length) { ed.loadState(t.state); ed.setBreakpoints(s.bps); t.state = ed.saveState(); }
+    R.tabs.push(t);
+  }
+  const act = R.tabs[LS.get("rv.active", 0)] || R.tabs[0];
+  unstash(act);
+  renderTabs();
+  // pick up edits made outside SV Studio to files that had no unsaved changes here
+  for (const t of R.tabs) {
+    if (!t.path || t.dirty) continue;
+    api("/api/asm/read", { path: t.path }).then((r) => {
+      if (typeof r.text !== "string") return;
+      const live = t === R.cur;
+      const cur = live ? ed.getDoc() : t.state.doc.toString();
+      if (r.text === cur || (live && R.dirty)) return;
+      const st = ed.makeState(r.text);
+      if (live) { R.switching = true; ed.loadState(st); R.switching = false; liveCheck(); } else t.state = st;
+    }).catch(() => { /* file moved or deleted: keep the saved copy */ });
+  }
+}
 
 async function save(as = false) {
   let path = R.path;
@@ -188,13 +321,12 @@ async function save(as = false) {
   }
   try {
     const r = await api("/api/asm/save", { path, text: ed.getDoc() });
-    R.path = r.path; LS.set("rv.path", R.path); R.dirty = false; renderFile(); toast("Saved " + fname(), "ok");
+    R.path = r.path; R.dirty = false; renderFile(); persistSoon(); toast("Saved " + fname(), "ok");
   } catch (e) { toast(e.message, "err"); }
 }
 
 async function openFile(path) {
   if (!path) {
-    if (R.dirty && !confirm("Discard unsaved changes to " + fname() + "?")) return;
     try { path = (await api("/api/browse", { kind: "asm", start: R.path ? R.path.replace(/[\\/][^\\/]*$/, "") : "" })).path; }
     catch (e) { toast(e.message, "err"); return; }
     if (!path) return;
@@ -202,13 +334,16 @@ async function openFile(path) {
   let r;
   try { r = await api("/api/asm/read", { path }); } catch (e) { toast(e.message, "err"); return; }
   if (/\.(s|asm)$/i.test(path)) {
+    const norm = (x) => (x || "").replace(/\\/g, "/").toLowerCase();
+    const open = R.tabs.find(t => norm(t === R.cur ? R.path : t.path) === norm(r.path));
+    if (open) { switchTab(open); return; }
     stop();
-    ed.setDoc(r.text); ed.setBreakpoints([]);
     const d = detectDialect(r.text);
-    if (d && d !== R.mode) { setMode(d, true); toast(`Switched to ${d === "bennett" ? "Bennett (COMP15111)" : "GNU / generic"} syntax for this file`, ""); }
-    R.path = r.path; LS.set("rv.path", R.path); LS.set("rv.draft", r.text); R.dirty = false; renderFile();
-    R.asm = null; R.loaded = false; setStatus("Not assembled", "");
-    liveCheck(); assemble();
+    const t = blankTab(r.text, { path: r.path, mode: d || R.mode });
+    if (R.cur && isScratch(R.cur) && R.tabs.length) { const old = R.cur; addTab(t); R.tabs.splice(R.tabs.indexOf(old), 1); renderTabs(); }
+    else addTab(t);
+    if (d && d !== LS.get("rv.mode", "bennett")) toast(`Opened with ${d === "bennett" ? "Bennett (COMP15111)" : "GNU / generic"} syntax`, "");
+    assemble();
     return;
   }
   // memory image (.hex / .txt / .bin / .kmd)
@@ -259,7 +394,7 @@ function parseKMD(text) {
 }
 
 function setMode(mode, quiet) {
-  R.mode = mode; LS.set("rv.mode", mode); el("#rvMode").value = mode;
+  R.mode = mode; LS.set("rv.mode", mode); el("#rvMode").value = mode; renderTabs(); persistSoon();
   applyMode(); stop(); R.m = makeMachine(); R.asm = null; R.loaded = false;
   liveCheck();
   if (!quiet) { setStatus("Not assembled", ""); refresh(true); }
@@ -271,11 +406,7 @@ el("#rvMode").onchange = () => {
   if (d && d !== mode) toast(`This program looks like ${d === "bennett" ? "Bennett" : "GNU"} syntax — it may not assemble in this mode`, "");
 };
 
-el("#rvNew").onclick = () => {
-  if (R.dirty && !confirm("Discard unsaved changes to " + fname() + "?")) return;
-  stop(); ed.setDoc(NEW_DOC()); ed.setBreakpoints([]);
-  R.path = null; LS.set("rv.path", null); R.dirty = false; renderFile(); R.asm = null; R.loaded = false; setStatus("Not assembled", ""); refresh(true);
-};
+el("#rvNew").onclick = () => newProgram();
 el("#rvOpen").onclick = () => openFile();
 el("#rvSave").onclick = () => save();
 
@@ -742,6 +873,23 @@ bindSeg("#rvFmt", "fmt");
   rz.ondblclick = () => { right.style.width = ""; LS.set("size.rvRight", null); };
 })();
 
+/* ---------- horizontal splitters: console height, registers height */
+function hSplit(handle, target, key, { invert = false, min = 60, max = () => window.innerHeight * 0.7 } = {}) {
+  const apply = (h) => { target.style.flex = `0 0 ${h}px`; target.style.height = h + "px"; target.style.maxHeight = "none"; };
+  const saved = LS.get(key, null); if (saved) apply(saved);
+  handle.onmousedown = (e) => {
+    e.preventDefault();
+    const sy = e.clientY, sh = target.getBoundingClientRect().height;
+    handle.classList.add("active"); document.body.classList.add("resizing-v");
+    const mv = (ev) => { const d = ev.clientY - sy; apply(Math.max(min, Math.min(max(), sh + (invert ? -d : d)))); ed.view.requestMeasure(); };
+    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); handle.classList.remove("active"); document.body.classList.remove("resizing-v"); LS.set(key, Math.round(target.getBoundingClientRect().height)); ed.view.requestMeasure(); };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+  };
+  handle.ondblclick = () => { target.style.flex = ""; target.style.height = ""; target.style.maxHeight = ""; LS.set(key, null); ed.view.requestMeasure(); };
+}
+hSplit(el("#rvConResize"), el("#rvConsole"), "size.rvConsole", { invert: true, min: 50 });
+hSplit(el("#rvRegResize"), document.querySelector(".rv-regs"), "size.rvRegs", { min: 80, max: () => el("#rvRight").getBoundingClientRect().height - 120 });
+
 /* ---------- keyboard (only while the RISC-V tab is showing) */
 window.addEventListener("keydown", (e) => {
   if (!el("#tab-riscv").classList.contains("active")) return;
@@ -779,10 +927,13 @@ if (typeof COMMANDS !== "undefined") {
   COMMANDS.push(["RISC-V: Assemble", "F7", () => { showTab("riscv"); assemble(); }, "⟨⟩"]);
   COMMANDS.push(["RISC-V: Run", "F5", () => { showTab("riscv"); run(); }, "▶"]);
   COMMANDS.push(["RISC-V: Open program…", "", () => { showTab("riscv"); openFile(); }, "📂"]);
-  COMMANDS.push(["RISC-V: Load example program", "", () => { showTab("riscv"); ed.setDoc(EXAMPLE()); R.dirty = true; renderFile(); assemble(); }, "✎"]);
+  COMMANDS.push(["RISC-V: Load example program", "", () => { showTab("riscv"); newProgram(EXAMPLE()); assemble(); }, "✎"]);
 }
-window.addEventListener("beforeunload", (e) => { if (R.dirty && R.path) { e.preventDefault(); e.returnValue = ""; } });
+// unsaved programs are kept in the state folder, so closing the window never loses work
+const saveAll = () => { if (persistT) persistNow(); LS.flush(true); };
+window.addEventListener("pagehide", saveAll);
+window.addEventListener("beforeunload", saveAll);
 
-if (R.path && !R.dirty) renderFile();
+restoreTabs();
 refresh(true);
 })();

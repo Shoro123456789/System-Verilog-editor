@@ -2,10 +2,48 @@
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const LS = {
-  get(k, d) { try { const v = localStorage.getItem("svs." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("svs." + k, JSON.stringify(v)); } catch (e) {} },
-};
+// Settings and UI state are kept by the backend in ~/.svstudio/ui-state.json (the window's own
+// storage can be wiped between runs), with localStorage as a fallback/migration source.
+const LS = (() => {
+  const mem = (window.SVS_STATE && typeof window.SVS_STATE === "object") ? window.SVS_STATE : {};
+  let pending = {}, timer = null;
+  const fromLocal = (k) => { try { const v = localStorage.getItem("svs." + k); return v === null ? undefined : JSON.parse(v); } catch (e) { return undefined; } };
+  function flush(beacon) {
+    clearTimeout(timer); timer = null;
+    if (!Object.keys(pending).length) return;
+    const body = JSON.stringify({ set: pending });
+    pending = {};
+    const url = "/api/state?token=" + encodeURIComponent(window.SVS_TOKEN);
+    if (beacon && navigator.sendBeacon) { try { navigator.sendBeacon(url, new Blob([body], { type: "text/plain" })); return; } catch (e) {} }
+    fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-SVS-Token": window.SVS_TOKEN }, body, keepalive: body.length < 60000 }).catch(() => {});
+  }
+  // first run with the state folder: copy over anything the old localStorage-only version saved
+  if (!Object.keys(mem).length) {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("svs.")) { const v = fromLocal(k.slice(4)); if (v !== undefined && v !== null) { mem[k.slice(4)] = v; pending[k.slice(4)] = v; } }
+      }
+      if (Object.keys(pending).length) timer = setTimeout(() => flush(false), 1000);
+    } catch (e) {}
+  }
+  window.addEventListener("pagehide", () => flush(true));
+  window.addEventListener("beforeunload", () => flush(true));
+  return {
+    get(k, d) {
+      if (Object.prototype.hasOwnProperty.call(mem, k)) return mem[k] === null ? d : mem[k];
+      const v = fromLocal(k); return v === undefined || v === null ? d : v;
+    },
+    set(k, v) {
+      if (v === undefined) v = null;
+      mem[k] = v;
+      try { localStorage.setItem("svs." + k, JSON.stringify(v)); } catch (e) {}
+      pending[k] = v;
+      if (!timer) timer = setTimeout(() => flush(false), 500);
+    },
+    flush,
+  };
+})();
 
 const S = { project: null, tools: {}, config: {}, job: null, since: 0, file: null, dirty: false, errors: 0, warnings: 0, diags: new Map() };
 
@@ -35,6 +73,8 @@ const basename = (p) => (p || "").replace(/\\/g, "/").split("/").pop();
 
 /* ---------------------------------------------------------------- tabs */
 function showTab(name) {
+  document.body.dataset.tab = name;
+  LS.set("ui.tab", name);
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + name));
   if (name === "wave") wave.draw();
@@ -144,6 +184,9 @@ async function openProject(path) {
     toast(`Opened ${S.project.name}`, "ok");
     const last = LS.get("vcd." + S.project.root, null);
     if (last) loadVCD(last, true);
+    const cur = LS.get("ui.tab", "console");
+    await restoreEdTabs();
+    showTab(cur);
   } catch (e) { toast(e.message, "err"); status("Ready"); }
 }
 
@@ -386,7 +429,23 @@ const editor = SVEditor.create($("#cmHost"), {
 });
 function syncEditor() { requestAnimationFrame(() => editor.view.requestMeasure()); }
 
+function rememberEdTabs() {
+  if (!S.project || S.restoringTabs) return;
+  LS.set("edtabs." + S.project.root, { files: S.tabs.map(t => t.path), active: S.file });
+}
+async function restoreEdTabs() {
+  if (!S.project) return;
+  const saved = LS.get("edtabs." + S.project.root, null);
+  if (!saved || !saved.files || !saved.files.length) return;
+  S.restoringTabs = true;
+  try {
+    for (const p of saved.files) { if (!findTab(p)) { try { const r = await api("/api/file?path=" + encodeURIComponent(p)); S.tabs.push({ path: p, state: editor.makeState(r.text), dirty: false, mtime: r.mtime }); } catch (e) {} } }
+    const act = (saved.active && findTab(saved.active)) || S.tabs[0];
+    if (act) { const tab = LS.get("ui.tab", "console"); activate(act); showTab(tab); }
+  } finally { S.restoringTabs = false; }
+}
 function renderTabs() {
+  rememberEdTabs();
   const box = $("#edTabs");
   box.innerHTML = "";
   for (const t of S.tabs) {
@@ -838,9 +897,20 @@ window.addEventListener("beforeunload", (e) => { if (anyDirty()) { e.preventDefa
       const last = LS.get("vcd." + S.project.root, null);
       if (last) loadVCD(last, true);
       status(`Opened ${S.project.name}`);
+      await restoreEdTabs();
+    } else if ((S.config.recent || []).length && LS.get("ui.reopenProject", true)) {
+      try {   // pick up where you left off: reopen the last project
+        S.project = await api("/api/open", { path: S.config.recent[0] });
+        renderProject();
+        const last = LS.get("vcd." + S.project.root, null);
+        if (last) loadVCD(last, true);
+        status(`Reopened ${S.project.name}`);
+        await restoreEdTabs();
+      } catch (e) { S.project = null; status("Ready — open a project to start"); }
     } else if ((S.config.recent || []).length) {
       status("Ready — open a project to start");
     }
+    showTab(LS.get("ui.tab", "console"));
   } catch (e) { toast("Cannot reach SV Studio backend: " + e.message, "err"); }
   setInterval(() => api("/api/ping").catch(() => status("Backend not running — restart SV Studio")), 20000);
   // closing the window shuts SV Studio down (a reload pings again straight away, which cancels this)

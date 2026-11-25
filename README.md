@@ -215,6 +215,14 @@ keypad and displays: through DPI and a small C++ harness with Verilator, or thro
 UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colours for
 `Crossing_A`, and which end Digit0 sits at, are assumptions; each lamp is labelled with its bit.
 
+## Where SV Studio keeps your settings
+
+SV Studio saves its state in its own folder, `~/.svstudio` (on Windows, `C:\Users\<you>\.svstudio`).
+The file `ui-state.json` there holds the open RISC-V tabs, including unsaved text and breakpoints,
+the editor tabs for each project, the last tab you used, panel sizes, and view options.
+On start-up SV Studio reopens your last project and puts everything back where you left it.
+Delete the file to reset the layout. Tool paths and recent projects stay in `~/.svstudio.json`.
+
 ## RISC-V simulator (COMP15111)
 
 The **RISC-V** tab is a built-in assembler and debugger for RV32IM programs, similar to Bennett but
@@ -253,6 +261,9 @@ When you open a file, SV Studio switches to the mode that matches its syntax.
   RARS print/read int, string and char, exit (10 and 93), and write/read (64/63).
 - **Generic mode assembler** supports labels, numeric local labels (`1:` / `1b` / `1f`), `.text`/`.data`,
   `.word`/`.half`/`.byte`, `.asciz`, `.space`, `.align`, `.equ`, `%hi`/`%lo`, and the usual pseudo-instructions.
+- **Tabs:** open several programs at once with **+** or **Open**. Each tab keeps its own breakpoints, mode,
+  run state and console. Unsaved tabs are kept when you close SV Studio.
+- **Resizable panels:** drag the bar above the console or below the registers. Double-click a bar to reset it.
 - **Open** `.s`, `.kmd` (Bennett's listing format, including symbols), `.hex`/`.txt` or `.bin` files.
 - **Not supported:** the lab FPGA boards, and the rarely used `RECORD`, `INCLUDE`, `IF` and literal-pool
   directives in Bennett mode. Out-of-range memory accesses stop with an explanation, where Bennett would

@@ -94,6 +94,41 @@ def save_config(cfg):
 
 CONFIG = load_config()
 
+# UI state (open tabs, RISC-V programs, panel sizes, view options...) lives in its own folder so it
+# survives restarts whatever window/browser profile the UI runs in. Windows: C:\\Users\\<you>\\.svstudio
+STATE_DIR = Path.home() / ".svstudio"
+UI_STATE_PATH = STATE_DIR / "ui-state.json"
+_ui_lock = threading.Lock()
+
+
+def load_ui_state():
+    try:
+        v = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+UI_STATE = load_ui_state()
+
+
+def save_ui_state(changes, deletes=()):
+    with _ui_lock:
+        for k, v in (changes or {}).items():
+            if v is None:
+                UI_STATE.pop(k, None)
+            else:
+                UI_STATE[str(k)] = v
+        for k in deletes or ():
+            UI_STATE.pop(k, None)
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = UI_STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(UI_STATE, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, UI_STATE_PATH)
+        except Exception as e:
+            print("Could not save UI state:", e)
+
 
 # --------------------------------------------------------------------------- tool discovery
 def _exe(name):
@@ -2331,6 +2366,9 @@ class Handler(BaseHTTPRequestHandler):
             data = f.read_bytes()
             if f.name == "index.html":
                 data = data.replace(b"__SVS_TOKEN__", TOKEN.encode())
+                with _ui_lock:
+                    st = json.dumps(UI_STATE).replace("</", "<\\/")
+                data = data.replace(b"__SVS_STATE__", st.encode("utf-8"))
             return self._send(200, data, MIME.get(f.suffix, "application/octet-stream"))
         if u.path == "/api/alive" and q.get("token") == TOKEN:
             return self._alive_stream()
@@ -2400,6 +2438,13 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/bye" and self._host_ok() and parse_qs(u.query).get("token", [""])[0] == TOKEN:
             STATE["bye"] = time.time()   # window closed (or reloading - a ping within a few seconds cancels)
             return self._send(200, {"ok": True})
+        if u.path == "/api/state" and self._host_ok() and (parse_qs(u.query).get("token", [""])[0] == TOKEN or self._api_ok()):
+            try:
+                b = self._body()   # {"set": {key: value}, "del": [key]}; sent with sendBeacon on close
+                save_ui_state(b.get("set") or {}, b.get("del") or [])
+                return self._send(200, {"ok": True})
+            except Exception as e:
+                return self._send(400, {"error": str(e)})
         if not self._host_ok() or not self._api_ok():
             return self._send(403, {"error": "forbidden"})
         try:

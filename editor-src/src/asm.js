@@ -240,6 +240,14 @@ export function createAsm(parent, opts = {}, theme) {
     view,
     getDoc: () => view.state.doc.toString(),
     setDoc(text) { view.setState(EditorState.create({ doc: text, extensions })); },
+    makeState: (text) => EditorState.create({ doc: text, extensions }),
+    saveState: () => view.state,
+    loadState(st) { view.setState(st); },
+    breakpointsOf(st) {
+      const out = []; const doc = st.doc;
+      st.field(bpField).between(0, doc.length, (from) => { out.push(doc.lineAt(from).number); });
+      return out;
+    },
     breakpoints() {
       const out = []; const doc = view.state.doc;
       view.state.field(bpField).between(0, doc.length, (from) => { out.push(doc.lineAt(from).number); });

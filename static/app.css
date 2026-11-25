@@ -639,3 +639,23 @@ body.resizing * { cursor: col-resize !important; }
   .rv-fname { max-width: 120px; }
   .rv-panel-head .seg-toggle.sm button { padding: 3px 6px; }
 }
+
+/* SystemVerilog-only toolbar controls are hidden on the RISC-V tab */
+body[data-tab="riscv"] .sv-only { display: none !important; }
+/* RISC-V program tabs + splitters */
+.rv-tabbar { display: flex; align-items: stretch; gap: 1px; flex: none; overflow-x: auto; background: var(--bg2); border-bottom: 1px solid var(--line); scrollbar-width: thin; }
+.rv-tab { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; font: 12.5px var(--mono); color: var(--muted); cursor: pointer; border-right: 1px solid var(--line); white-space: nowrap; border-top: 2px solid transparent; }
+.rv-tab:hover { color: var(--text); background: var(--panel); }
+.rv-tab.active { color: var(--text); background: var(--bg); border-top-color: var(--accent); }
+.rv-tab .tm { font-size: 10px; color: var(--dim); }
+.rv-tab .x { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; color: var(--dim); font-size: 14px; }
+.rv-tab .x:hover { background: var(--panel2); color: var(--text); }
+.rv-tab.dirty .x { font-size: 0; }
+.rv-tab.dirty .x::before { content: "●"; font-size: 10px; color: var(--warn); }
+.rv-tab.dirty .x:hover { font-size: 14px; } .rv-tab.dirty .x:hover::before { content: none; }
+.rv-tab-add { background: none; border: 0; color: var(--muted); font-size: 18px; padding: 0 12px; cursor: pointer; }
+.rv-tab-add:hover { color: var(--text); background: var(--panel); }
+.rv-hresizer { height: 5px; flex: none; cursor: row-resize; background: var(--line); }
+.rv-hresizer:hover, .rv-hresizer.active { background: var(--accent); }
+body.resizing-v, body.resizing-v * { cursor: row-resize !important; user-select: none !important; }
+.rv-console { border-top: 0; }
