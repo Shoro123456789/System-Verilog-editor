@@ -659,3 +659,8 @@ body[data-tab="riscv"] .sv-only { display: none !important; }
 .rv-hresizer:hover, .rv-hresizer.active { background: var(--accent); }
 body.resizing-v, body.resizing-v * { cursor: row-resize !important; user-select: none !important; }
 .rv-console { border-top: 0; }
+
+/* drag-to-reorder tabs */
+.rv-tab.dragging, .ed-tab.dragging { opacity: .4; }
+.rv-tab.drop-before, .ed-tab.drop-before { box-shadow: inset 2px 0 0 var(--accent); }
+.rv-tab.drop-after, .ed-tab.drop-after { box-shadow: inset -2px 0 0 var(--accent); }

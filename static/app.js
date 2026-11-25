@@ -458,6 +458,24 @@ function renderTabs() {
     d.querySelector(".tname").textContent = basename(t.path);
     d.onmousedown = (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t); } };
     d.onclick = (e) => { if (e.target.classList.contains("x")) closeTab(t); else activate(t); };
+    d.draggable = true;   // drag to reorder
+    d.ondragstart = (e) => { S.dragTab = t; d.classList.add("dragging"); e.dataTransfer.effectAllowed = "move"; try { e.dataTransfer.setData("text/plain", basename(t.path)); } catch (_) {} };
+    d.ondragend = () => { S.dragTab = null; box.querySelectorAll(".ed-tab").forEach(x => x.classList.remove("dragging", "drop-before", "drop-after")); };
+    d.ondragover = (e) => {
+      if (!S.dragTab || S.dragTab === t) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = "move";
+      const r = d.getBoundingClientRect(), after = e.clientX > r.left + r.width / 2;
+      d.classList.toggle("drop-after", after); d.classList.toggle("drop-before", !after);
+    };
+    d.ondragleave = () => d.classList.remove("drop-before", "drop-after");
+    d.ondrop = (e) => {
+      e.preventDefault();
+      const src = S.dragTab; if (!src || src === t) return;
+      const r = d.getBoundingClientRect(), after = e.clientX > r.left + r.width / 2;
+      S.tabs.splice(S.tabs.indexOf(src), 1);
+      S.tabs.splice(S.tabs.indexOf(t) + (after ? 1 : 0), 0, src);
+      S.dragTab = null; renderTabs();
+    };
     box.appendChild(d);
     if (d.classList.contains("active")) setTimeout(() => d.scrollIntoView({ block: "nearest", inline: "nearest" }), 0);
   }
