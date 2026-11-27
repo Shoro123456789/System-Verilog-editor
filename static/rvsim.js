@@ -503,6 +503,7 @@ function run(mode = "run") {
     if (mode === "out" && depth === 0) { R.stopAt = null; sys("Not inside a call — step out needs a function that was entered with call/jal.", "sys"); return; }
   } else R.stopAt = null;
   R.running = true;
+  el("#rvRun").classList.add("running");
   R.m.status = "running";
   setStatus("Running", "running");
   el("#rvRun").querySelector("span").textContent = "Pause";
@@ -534,6 +535,7 @@ function tick(first) {
   const done = m.status !== "running";
   if (stopMsg !== null || done) {
     R.running = false; R.stopAt = null;
+    el("#rvRun").classList.remove("running");
     el("#rvRun").querySelector("span").textContent = "Run";
     if (m.status === "running") m.status = "paused";
     if (stopMsg) sys(stopMsg, "sys");
@@ -689,6 +691,7 @@ function refresh(full) {
   el("#rvCycles").textContent = R.loaded ? `${m.cycles.toLocaleString()} instructions` + (m.frames.length ? ` · depth ${m.frames.length}` : "") : "";
   const ab = el("#rvAbiBadge"); ab.hidden = !m.abiWarnings.length; ab.textContent = m.abiWarnings.length;
   const b = el("#rvBadge"); b.hidden = !R.running; b.textContent = "run";
+  el("#rvRun").classList.toggle("running", R.running);
   if (full || R.pane === "mem") renderPane();
 }
 
@@ -848,7 +851,7 @@ function renderCode() {
   let html = "";
   for (let a = lo; a < hi; a += 4) {
     const ln = lineOf(a), sym = m.symbolAt(a);
-    if (sym) html += `<div class="rv-row" style="color:#89ddff" data-ln="${ln || 0}"><span></span><span></span><span></span><span class="v" style="color:#89ddff">${escH(sym)}:</span><span></span></div>`;
+    if (sym) html += `<div class="rv-row" style="color:var(--syn-label)" data-ln="${ln || 0}"><span></span><span></span><span></span><span class="v" style="color:var(--syn-label)">${escH(sym)}:</span><span></span></div>`;
     html += `<div class="rv-row ${a === m.pc ? "cur" : ""}" data-ln="${ln || 0}" data-a="${a}"><span class="bp">${R.bpAddrs.has(a) ? "●" : ""}</span><span class="a">${hx(a)}</span><span class="c">${hx(m.peek32(a))}</span>` +
       `<span class="v">${escH(disasmAt(a))}</span><span class="ln">${ln ? "L" + ln : ""}</span></div>`;
   }

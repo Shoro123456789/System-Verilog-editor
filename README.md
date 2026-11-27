@@ -215,6 +215,19 @@ keypad and displays: through DPI and a small C++ harness with Verilator, or thro
 UART/Ackie link and the warm-boot reset aren't modelled. The traffic-light colours for
 `Crossing_A`, and which end Digit0 sits at, are assumptions; each lamp is labelled with its bit.
 
+## Themes and animations
+
+Open **Settings** (the gear icon) to choose one of 13 colour themes. The dark themes are Midnight, One Dark,
+Dracula, Nord, Tokyo Night, Catppuccin Mocha, Monokai, Solarized Dark, GitHub Dark and High Contrast;
+the light themes are GitHub Light, Solarized Light and Catppuccin Latte. A theme applies straight away,
+including the code editors and waveforms. You can also switch from the command palette
+(`Ctrl+Shift+P`, then type "Theme").
+
+Animations are short (under 0.2 s) and never hold anything up: views fade in, dialogs pop,
+the tab underline slides, changed registers flash, and the RISC-V Run button glows while a
+program runs. Set them to **Reduced** (feedback only) or **Off** in Settings. Your system's
+"reduce motion" setting is respected too.
+
 ## Where SV Studio keeps your settings
 
 SV Studio saves its state in its own folder, `~/.svstudio` (on Windows, `C:\Users\<you>\.svstudio`).

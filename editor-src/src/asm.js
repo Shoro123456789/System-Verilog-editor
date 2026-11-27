@@ -53,14 +53,14 @@ const rvLang = StreamLanguage.define({
 });
 
 const highlight = HighlightStyle.define([
-  { tag: t.keyword, color: "#c792ea", fontWeight: "600" },
-  { tag: t.comment, color: "#637089", fontStyle: "italic" },
-  { tag: t.string, color: "#c3e88d" },
-  { tag: t.number, color: "#f78c6c" },
-  { tag: t.meta, color: "#ffcb6b" },
-  { tag: t.typeName, color: "#82aaff" },
-  { tag: t.labelName, color: "#89ddff", fontWeight: "600" },
-  { tag: t.variableName, color: "#d4d9e6" },
+  { tag: t.keyword, color: "var(--syn-kw)", fontWeight: "600" },
+  { tag: t.comment, color: "var(--syn-com)", fontStyle: "italic" },
+  { tag: t.string, color: "var(--syn-str)" },
+  { tag: t.number, color: "var(--syn-num)" },
+  { tag: t.meta, color: "var(--syn-meta)" },
+  { tag: t.typeName, color: "var(--syn-type)" },
+  { tag: t.labelName, color: "var(--syn-label)", fontWeight: "600" },
+  { tag: t.variableName, color: "var(--syn-var)" },
 ]);
 
 /* ------------------------------------------------------------------ breakpoints + exec line */

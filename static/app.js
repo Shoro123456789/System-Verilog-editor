@@ -76,6 +76,7 @@ function showTab(name) {
   document.body.dataset.tab = name;
   LS.set("ui.tab", name);
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  if (typeof moveInk === "function") moveInk();
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + name));
   if (name === "wave") wave.draw();
   if (name === "editor") syncEditor();
@@ -709,6 +710,10 @@ const COMMANDS = [
   ["Waveform: clear view", "", () => wave.clearRows(), "∿"],
   ["Waveform: open VCD file…", "", () => $("#wOpen").click(), "∿"],
   ["Clear console", "", () => $("#btnClear").click(), "⌫"],
+  ...SVTheme.THEMES.map(th => [`Theme: ${th.name}`, "", () => setTheme(th.id), "◐"]),
+  ["Animations: Full", "", () => LS.set("ui.motion", SVTheme.applyMotion("full")), "✦"],
+  ["Animations: Reduced", "", () => LS.set("ui.motion", SVTheme.applyMotion("reduced")), "✦"],
+  ["Animations: Off", "", () => LS.set("ui.motion", SVTheme.applyMotion("off")), "✦"],
   ["Simulator: Questa", "", () => { $("#selBackend").value = "questa"; LS.set("backend", "questa"); }, "⚙"],
   ["Simulator: Verilator", "", () => { $("#selBackend").value = "verilator"; LS.set("backend", "verilator"); }, "⚙"],
   ["Simulator: Icarus", "", () => { $("#selBackend").value = "icarus"; LS.set("backend", "icarus"); }, "⚙"],
@@ -873,7 +878,42 @@ function showSettings() {
     `Icarus:    ${esc(t.icarus || "not found")}<br>VS Code:   ${esc(t.vscode || "not found")}`;
   $("#dlgSettings").showModal();
 }
-$("#btnSettings").onclick = showSettings;
+$("#btnSettings").onclick = () => { renderThemeGrid(); $("#setMotion").value = LS.get("ui.motion", "full"); showSettings(); };
+
+/* ---------------------------------------------------------------- appearance: themes + animations */
+function setTheme(id) {
+  const apply = () => { const th = SVTheme.applyTheme(id); LS.set("ui.theme", th.id); if (typeof wave !== "undefined" && wave.draw) wave.draw(); renderThemeGrid(); };
+  // a short cross-fade between themes where the browser supports it (and animations are on)
+  if (document.startViewTransition && document.documentElement.dataset.motion === "full") document.startViewTransition(apply);
+  else apply();
+}
+function renderThemeGrid() {
+  const g = $("#themeGrid"); if (!g) return;
+  const cur = document.documentElement.dataset.theme;
+  g.innerHTML = "";
+  for (const th of SVTheme.THEMES) {
+    const v = { bg: "#0d1017", panel: "#161b26", accent: "#7c5cff", "syn-kw": "#c792ea", "syn-str": "#c3e88d", "syn-num": "#f78c6c", ...th.v };
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "theme-card" + (th.id === cur ? " active" : "");
+    b.innerHTML = `<div class="tsw">${[v.bg, v.panel, v.accent, v["syn-kw"], v["syn-str"], v["syn-num"]].map(c => `<i style="background:${c}"></i>`).join("")}</div>${esc(th.name)}`;
+    b.onclick = () => setTheme(th.id);
+    g.appendChild(b);
+  }
+}
+$("#setMotion").onchange = (e) => LS.set("ui.motion", SVTheme.applyMotion(e.target.value));
+
+// sliding underline under the main tabs
+var tabInk = document.createElement("div");   // var: showTab may run before this line
+tabInk.className = "tab-ink";
+$("#tabs").appendChild(tabInk); $("#tabs").classList.add("has-ink");
+function moveInk() {
+  if (!tabInk) return;
+  const b = $("#tabs button.active"); if (!b) { tabInk.style.width = "0"; return; }
+  tabInk.style.width = b.offsetWidth + "px";
+  tabInk.style.transform = `translateX(${b.offsetLeft}px)`;
+}
+window.addEventListener("resize", moveInk);
+requestAnimationFrame(moveInk);
 $("#settingsSave").onclick = async () => {
   const body = {};
   document.querySelectorAll("[data-cfg]").forEach(el => body[el.dataset.cfg] = el.type === "checkbox" ? el.checked : el.value.trim());
