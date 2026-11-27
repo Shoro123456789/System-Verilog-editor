@@ -98,7 +98,10 @@ On other CPUs, install `iverilog` from your package manager.
 ---
 
 ## Updating
-SV Studio checks this repo every time it starts and installs updates automatically. While it's
+SV Studio checks this repo every time it starts. When there's an update, it opens an **update window**
+straight away. The window shows the version change, what's new, and each step (check → download → install
+→ restart) with a progress bar. When it's done, SV Studio reopens where you left off. If an update fails,
+the window says why and offers **Try again** or **Continue without updating**. While SV Studio is
 running, an **Update & restart** bar appears when there's something new. **⚙ Settings → Updates**
 lets you choose *automatic*, *ask first* or *never*. If you cloned with git, it runs `git pull` instead.
 

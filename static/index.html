@@ -52,7 +52,28 @@
   <button class="icon-btn sm" id="updateClose" title="Later"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
   <div class="ub-list" id="updateList" hidden></div>
 </div>
-<div class="restart-overlay" id="restartOverlay" hidden><div><div class="spinner"></div><h3 id="restartTitle">Updating SV Studio…</h3><p class="muted" id="restartSub">Downloading the latest version from GitHub.</p></div></div>
+<div class="restart-overlay" id="restartOverlay" hidden>
+  <div class="upd-card" role="dialog" aria-live="polite">
+    <div class="upd-head">
+      <div class="upd-logo"><svg viewBox="0 0 32 32" width="34" height="34"><rect width="32" height="32" rx="8" fill="url(#g)"/><path d="M5 21h5V11h6v10h5V11h6" fill="none" stroke="#fff" stroke-width="2.6" stroke-linejoin="round"/></svg><span class="upd-spin" id="updSpin"></span></div>
+      <div><h3 id="restartTitle">Updating SV Studio</h3><div class="muted small" id="updVersions"></div></div>
+    </div>
+    <ol class="upd-steps" id="updSteps">
+      <li data-s="check"><i></i>Check for the new version</li>
+      <li data-s="download"><i></i>Download</li>
+      <li data-s="install"><i></i>Install</li>
+      <li data-s="restart"><i></i>Restart</li>
+    </ol>
+    <div class="upd-bar"><div class="upd-fill" id="updFill"></div></div>
+    <div class="upd-detail" id="restartSub">Starting…</div>
+    <div class="upd-news" id="updNews" hidden></div>
+    <div class="upd-note muted small" id="updNote">Your open files and unsaved RISC-V programs are kept — SV Studio reopens where you left off.</div>
+    <div class="upd-actions" id="updActions" hidden>
+      <button class="btn ghost" id="updSkip">Continue without updating</button>
+      <button class="btn primary" id="updRetry">Try again</button>
+    </div>
+  </div>
+</div>
 
 <div class="layout">
   <aside class="sidebar">

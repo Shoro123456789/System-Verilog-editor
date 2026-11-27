@@ -953,6 +953,7 @@ if (typeof COMMANDS !== "undefined") {
 }
 // unsaved programs are kept in the state folder, so closing the window never loses work
 const saveAll = () => { if (persistT) persistNow(); LS.flush(true); };
+(window.SVS_BEFORE_UPDATE = window.SVS_BEFORE_UPDATE || []).push(() => persistNow());
 window.addEventListener("pagehide", saveAll);
 window.addEventListener("beforeunload", saveAll);
 

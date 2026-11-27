@@ -781,6 +781,7 @@ class Job:
                 "id": self.id, "kind": self.kind, "lines": self.lines[since:],
                 "next": len(self.lines), "done": self.done, "ok": self.ok, "vcd": self.vcd,
                 "elapsed": round(time.time() - self.started, 2),
+                "progress": getattr(self, "progress", None),
             }
 
 
@@ -2386,6 +2387,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not job:
                     return self._send(404, {"error": "no such job"})
                 return self._send(200, job.snapshot(int(q.get("since", 0))))
+            if u.path == "/api/update/startup":
+                return self._send(200, startup_update_info())
             if u.path == "/api/update/check":
                 if CONFIG.get("auto_update", "auto") == "off" and not q.get("force"):
                     return self._send(200, {"available": False, "mode": "off", "current": local_commit()})
@@ -2655,10 +2658,30 @@ def check_update(force=False):
         return info
 
 
-def apply_update(log=print):
-    """Download the latest version from GitHub and copy it over this installation."""
+def _download(url, progress=None, timeout=120):
+    """GET url in chunks, reporting (bytes_done, bytes_total or 0) to progress()."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Accept": "*/*", "User-Agent": f"SVStudio/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        buf = bytearray()
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            buf += chunk
+            if progress:
+                progress(len(buf), total)
+        return bytes(buf)
+
+
+def apply_update(log=print, progress=None):
+    """Download the latest version from GitHub and copy it over this installation.
+    progress(phase, fraction 0..1 or None, detail) is called as it goes (for the update window)."""
     import io
     import zipfile
+    prog = progress or (lambda *a: None)
+    prog("check", None, "Checking GitHub for the latest version")
     info = check_update(force=True)
     if info.get("error"):
         raise RuntimeError(info["error"])
@@ -2667,22 +2690,30 @@ def apply_update(log=print):
         return False
     sha = info["latest"]
     if info["git"] and shutil.which("git"):
+        prog("download", None, "Pulling the latest changes with git")
         log("Updating the git checkout (git pull)…")
         r = subprocess.run(["git", "-C", str(APP_DIR), "pull", "--ff-only"], capture_output=True, text=True,
                            timeout=180, creationflags=0x08000000 if IS_WIN else 0)
         log((r.stdout + r.stderr).strip())
         if r.returncode != 0:
             raise RuntimeError("git pull failed - you may have local changes. Update manually.")
+        prog("install", 1.0, "Updated with git")
         return True
     log(f"Downloading {UPDATE_REPO} @ {sha[:7]}…")
-    data = _gh_get(f"https://codeload.github.com/{UPDATE_REPO}/zip/{sha}", accept="*/*", timeout=120)
+    prog("download", 0.0, "Downloading")
+    data = _download(f"https://codeload.github.com/{UPDATE_REPO}/zip/{sha}",
+                     lambda done, total: prog("download", done / total if total else None,
+                                              f"{done / 1048576:.1f} MB" + (f" of {total / 1048576:.1f} MB" if total else "")))
     z = zipfile.ZipFile(io.BytesIO(data))
     names = [n for n in z.namelist() if not n.endswith("/")]
     prefix = names[0].split("/", 1)[0] + "/"
     if "svstudio.py" not in {n[len(prefix):] for n in names}:
         raise RuntimeError("Downloaded archive doesn't look like SV Studio")
     changed = 0
-    for n in names:
+    prog("install", 0.0, "Installing files")
+    for i, n in enumerate(names):
+        if i % 20 == 0:
+            prog("install", i / max(1, len(names)), f"Installing files ({i} of {len(names)})")
         rel = n[len(prefix):]
         if not rel or rel.split("/", 1)[0] in UPDATE_SKIP:
             continue
@@ -2719,6 +2750,7 @@ def apply_update(log=print):
                 continue
         changed += 1
     (APP_DIR / ".svs_commit").write_text(sha + "\n")
+    prog("install", 1.0, f"Updated {changed} file(s)")
     log(f"Updated {changed} file(s) to {sha[:7]}.")
     with UPDATE["lock"]:
         UPDATE["info"] = None
@@ -2757,10 +2789,13 @@ def restart_app():
 def update_worker(job):
     try:
         job.log(f"{APP_NAME} · updating from github.com/{UPDATE_REPO}", "info")
-        changed = apply_update(lambda m: job.log(m, "info"))
+        def progress(phase, frac, detail):
+            job.progress = {"phase": phase, "frac": frac, "detail": detail}
+        changed = apply_update(lambda m: job.log(m, "info"), progress)
         job.ok = True
         job.restart = changed
         if changed:
+            job.progress = {"phase": "restart", "frac": None, "detail": "Restarting SV Studio"}
             job.log("Restarting SV Studio…", "info")
     except Exception as e:
         job.log(f"Update failed: {e}", "err")
@@ -2772,23 +2807,24 @@ def update_worker(job):
             threading.Timer(1.0, restart_app).start()
 
 
-def startup_update():
-    """With auto_update = "auto", install a pending update before the app starts (then re-launch)."""
+def startup_cleanup():
     for old in APP_DIR.glob("*.old"):   # leftovers from replacing a running .exe
         try:
             old.unlink()
         except OSError:
             pass
-    if CONFIG.get("auto_update", "auto") != "auto" or os.environ.get("SVS_NO_UPDATE"):
-        return False
-    try:
-        info = check_update(force=True)
-        if info.get("available") and not info.get("error"):
-            print(f"Updating SV Studio to {info['latest'][:7]}…")
-            return apply_update()
-    except Exception as e:
-        print("Auto-update skipped:", e)
-    return False
+
+
+def startup_update_info():
+    """Called once by the window after it opens. In "auto" mode, says whether an update should be
+    installed now (the window then shows the update window and installs it)."""
+    mode = CONFIG.get("auto_update", "auto")
+    if STATE.get("startup_checked") or os.environ.get("SVS_NO_UPDATE") or mode == "off":
+        return {"available": False, "mode": mode, "current": local_commit(), "skip": True}
+    STATE["startup_checked"] = True
+    info = dict(check_update(force=True))
+    info["mode"] = mode
+    return info
 
 
 # --------------------------------------------------------------------------- window
@@ -2862,11 +2898,7 @@ def main():
         log = open(Path.home() / ".svstudio.log", "a", encoding="utf-8", buffering=1)
         sys.stdout = sys.stderr = log
 
-    if startup_update():   # updated on disk: run the new version instead
-        env = dict(os.environ, SVS_NO_UPDATE="1")
-        kw = {"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {}
-        subprocess.Popen(self_argv() + sys.argv[1:], cwd=str(APP_DIR), env=env, **kw)
-        return
+    startup_cleanup()   # automatic updates now run inside the window, which shows their progress
 
     if args.project:
         try:
